@@ -1,0 +1,10 @@
+provider: ark
+model: doubao-seed-1-8-251228
+api_key: ${ARK_API_KEY}
+base_url: "https://ark.cn-beijing.volces.com/api/v3"
+temperature: 0.0
+
+workspace: ./workspace
+max_memory: 100
+max_turns: 50
+max_actions: 20

@@ -1,0 +1,7 @@
+.env
+config.local.yaml
+workspace/
+cyberclaw
+cyberclaw.exe
+*.log
+.learnings/
