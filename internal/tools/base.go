@@ -71,7 +71,7 @@ func NewModelInfoTool(provider, model string) *ModelInfoTool {
 func (t *ModelInfoTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 	return &schema.ToolInfo{
 		Name: "get_system_model_info",
-		Desc: "Get the current LLM model and provider information being used by CyberClaw.",
+		Desc: "Get the current LLM model and provider information being used by CodeFlow.",
 	}, nil
 }
 

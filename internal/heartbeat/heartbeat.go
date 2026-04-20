@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/cloudwego/cyberclaw/internal/bus"
-	"github.com/cloudwego/cyberclaw/internal/tools"
+	"github.com/cloudwego/codeflow/internal/bus"
+	"github.com/cloudwego/codeflow/internal/tools"
 )
 
 func StartPacemaker(ctx context.Context, tasksFile string, interval time.Duration) {

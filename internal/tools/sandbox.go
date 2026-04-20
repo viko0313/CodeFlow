@@ -334,7 +334,7 @@ func validateShellCommand(command string) error {
 	}
 	for _, pattern := range patterns {
 		if regexp.MustCompile(pattern).FindString(command) != "" {
-			return errors.New("system blocked: violation of CyberClaw security protocol")
+			return errors.New("system blocked: violation of CodeFlow security protocol")
 		}
 	}
 	return nil

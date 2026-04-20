@@ -45,7 +45,7 @@ func LoadDynamicSkillTools(skillsDir, officeDir string) ([]tool.BaseTool, error)
 		}
 		content := string(data)
 		name := sanitizeToolName(firstMetadataValue(content, "name", entry.Name()))
-		desc := firstMetadataValue(content, "description", "External CyberClaw skill "+entry.Name())
+		desc := firstMetadataValue(content, "description", "External CodeFlow skill "+entry.Name())
 		loaded = append(loaded, &DynamicSkillTool{
 			name:        name,
 			desc:        desc,

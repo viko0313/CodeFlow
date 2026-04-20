@@ -12,7 +12,7 @@ import (
 	"github.com/cloudwego/eino-ext/components/model/qwen"
 	"github.com/cloudwego/eino/components/model"
 
-	"github.com/cloudwego/cyberclaw/internal/config"
+	"github.com/cloudwego/codeflow/internal/config"
 )
 
 type ProviderManager struct{}
@@ -50,7 +50,7 @@ func (pm *ProviderManager) CreateChatModel(ctx context.Context, cfg *config.Conf
 func (pm *ProviderManager) createOpenAICompatible(ctx context.Context, providerName string, cfg *config.Config) (model.ChatModel, error) {
 	apiKey := resolveAPIKey(providerName, cfg.APIKey)
 	if apiKey == "" {
-		return nil, fmt.Errorf("API key not found for provider %q; set ARK_API_KEY, VOLCENGINE_API_KEY, OPENAI_API_KEY, or CYBERCLAW_API_KEY", providerName)
+		return nil, fmt.Errorf("API key not found for provider %q; set ARK_API_KEY, VOLCENGINE_API_KEY, OPENAI_API_KEY, or CODEFLOW_API_KEY", providerName)
 	}
 
 	baseURL := cfg.BaseURL
@@ -124,14 +124,16 @@ func resolveAPIKey(provider, configured string) string {
 	if configured != "" {
 		return configured
 	}
-	envs := []string{"CYBERCLAW_API_KEY"}
-	if provider == "ark" || provider == "volcengine" {
-		envs = append(envs, "ARK_API_KEY", "VOLCENGINE_API_KEY")
+
+	var envs []string
+	switch provider {
+	case "ark", "volcengine":
+		envs = []string{"ARK_API_KEY", "VOLCENGINE_API_KEY", "CODEFLOW_API_KEY", "OPENAI_API_KEY"}
+	case "qwen", "dashscope", "aliyun":
+		envs = []string{"QWEN_API_KEY", "DASHSCOPE_API_KEY", "CODEFLOW_API_KEY", "OPENAI_API_KEY"}
+	default:
+		envs = []string{"CODEFLOW_API_KEY", "OPENAI_API_KEY"}
 	}
-	if provider == "qwen" || provider == "dashscope" || provider == "aliyun" {
-		envs = append(envs, "QWEN_API_KEY", "DASHSCOPE_API_KEY")
-	}
-	envs = append(envs, "OPENAI_API_KEY")
 	for _, name := range envs {
 		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
 			return v

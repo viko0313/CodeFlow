@@ -92,7 +92,7 @@ func mergeConfigFile(cfg *Config, path string, optional bool) error {
 		v.SetConfigType("yaml")
 		v.AddConfigPath(".")
 		v.AddConfigPath("./config")
-		v.AddConfigPath("$HOME/.cyberclaw")
+		v.AddConfigPath("$HOME/.codeflow")
 	}
 	if err := v.ReadInConfig(); err != nil {
 		if optional || isConfigNotFound(err) {
@@ -112,11 +112,11 @@ func isConfigNotFound(err error) bool {
 }
 
 func applyEnvOverrides(c *Config) {
-	setStringFromEnv(&c.Provider, "CYBERCLAW_PROVIDER", "DEFAULT_PROVIDER")
-	setStringFromEnv(&c.Model, "CYBERCLAW_MODEL", "DEFAULT_MODEL", "ARK_MODEL_ID")
-	setStringFromEnv(&c.APIKey, "CYBERCLAW_API_KEY", "ARK_API_KEY", "VOLCENGINE_API_KEY", "QWEN_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY")
-	setStringFromEnv(&c.BaseURL, "CYBERCLAW_BASE_URL", "ARK_BASE_URL", "VOLCENGINE_BASE_URL", "OLLAMA_BASE_URL", "OPENAI_API_BASE")
-	setStringFromEnv(&c.Workspace, "CYBERCLAW_WORKSPACE")
+	setStringFromEnv(&c.Provider, "CODEFLOW_PROVIDER", "DEFAULT_PROVIDER")
+	setStringFromEnv(&c.Model, "CODEFLOW_MODEL", "DEFAULT_MODEL", "ARK_MODEL_ID")
+	setStringFromEnv(&c.APIKey, "CODEFLOW_API_KEY", "ARK_API_KEY", "VOLCENGINE_API_KEY", "QWEN_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY")
+	setStringFromEnv(&c.BaseURL, "CODEFLOW_BASE_URL", "ARK_BASE_URL", "VOLCENGINE_BASE_URL", "OLLAMA_BASE_URL", "OPENAI_API_BASE")
+	setStringFromEnv(&c.Workspace, "CODEFLOW_WORKSPACE")
 }
 
 func setStringFromEnv(target *string, names ...string) {

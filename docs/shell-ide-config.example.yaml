@@ -1,0 +1,46 @@
+# Shell 可视化 IDE 配置示例
+
+ShellVisualizerConfig:
+  # Shell 执行目录
+  ShellDir: "./workspace/shell"
+
+  # 保留历史记录数量 (毫秒)
+  RetainHistory: 10
+
+  # 输出大小限制 (字节)
+  MaxOutputSize: 5000
+
+  # 自动补全 (true/false)
+  AutoComplete: true
+
+  # 颜色模式
+  ColorMode: "auto"
+
+  # 命令格式
+  CommandPrefix: "cd ."
+
+# 颜色映射
+ColorMappings:
+  - session_id: "#f59e0b"
+  - cmd: "#3b82f6"
+  - time: "#22c55e"
+  - error: "#ef4444"
+  - success: "#10b981"
+  - env: "#f59e0b"
+  - data: "#8b5cf6"
+  - err: "#ef4444"
+  - out: "#10b981"
+  - err2: "#8b5cf6"
+
+# 默认环境
+DefaultEnv:
+  PATH: "${PATH}/bin"
+  HOME: "${HOME}"
+
+# 历史记录清理
+HistoryCleanup:
+  MaxAge: "15m"
+
+# 配置
+Config:
+  Timeout: 30

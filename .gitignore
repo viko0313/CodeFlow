@@ -1,7 +1,10 @@
-.env
+﻿.env
 config.local.yaml
 workspace/
-cyberclaw
-cyberclaw.exe
+/codeflow
+/codeflow.exe
 *.log
 .learnings/
+.codeflow/logs/
+.codeflow/checkpoints/
+.codeflow/runtime/

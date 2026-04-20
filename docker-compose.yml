@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: codeflow-postgres
+    environment:
+      POSTGRES_USER: codeflow
+      POSTGRES_PASSWORD: codeflow
+      POSTGRES_DB: codeflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - codeflow-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codeflow -d codeflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: codeflow-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - codeflow-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  codeflow-postgres:
+  codeflow-redis:
