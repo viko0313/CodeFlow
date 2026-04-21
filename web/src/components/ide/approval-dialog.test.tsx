@@ -10,6 +10,7 @@ describe("ApprovalDialog", () => {
 
   it("sends an approval decision", () => {
     useUiStore.getState().setPendingApproval({
+      approval_id: "apr_123",
       operation_id: "op_123",
       kind: "shell",
       command: "git status",
@@ -19,10 +20,40 @@ describe("ApprovalDialog", () => {
     const send = vi.fn(() => true);
     render(<ApprovalDialog send={send} />);
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
-    expect(send).toHaveBeenCalledWith({
-      type: "permission.decide",
-      operation_id: "op_123",
-      allowed: true,
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "permission.decide",
+        approval_id: "apr_123",
+        operation_id: "op_123",
+        allowed: true,
+      }),
+    );
+  });
+
+  it("requires reason when denying", () => {
+    useUiStore.getState().setPendingApproval({
+      approval_id: "apr_456",
+      operation_id: "op_456",
+      kind: "write_file",
+      preview: "diff",
     });
+    const send = vi.fn(() => true);
+    render(<ApprovalDialog send={send} />);
+    fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+    expect(send).not.toHaveBeenCalled();
+    expect(screen.getByText("Reject reason is required.")).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("Reason required when denying"), {
+      target: { value: "unsafe command" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "permission.decide",
+        approval_id: "apr_456",
+        operation_id: "op_456",
+        allowed: false,
+        reason: "unsafe command",
+      }),
+    );
   });
 });

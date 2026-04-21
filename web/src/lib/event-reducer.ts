@@ -71,7 +71,10 @@ export function reduceServerEvent(state: EventState, event: ServerEvent): EventS
     return {
       ...state,
       pendingApproval: {
+        approval_id: event.approval_id,
         operation_id: event.operation_id,
+        request_id: event.request_id,
+        status: event.status,
         kind: event.kind ?? "operation",
         path: event.path,
         command: event.command,
@@ -81,6 +84,25 @@ export function reduceServerEvent(state: EventState, event: ServerEvent): EventS
       },
       timeline,
     };
+  }
+  if (event.type === "approval.updated") {
+    if (!state.pendingApproval) {
+      return { ...state, timeline };
+    }
+    if (event.approval_id && state.pendingApproval.approval_id && event.approval_id !== state.pendingApproval.approval_id) {
+      return { ...state, timeline };
+    }
+    if ((event.status ?? "").toLowerCase() === "pending") {
+      return {
+        ...state,
+        pendingApproval: {
+          ...state.pendingApproval,
+          status: event.status,
+        },
+        timeline,
+      };
+    }
+    return { ...state, pendingApproval: undefined, timeline };
   }
   if (event.type === "operation.done") {
     return { ...state, pendingApproval: undefined, timeline };

@@ -17,6 +17,9 @@ export type Health = {
   postgres_configured: boolean;
   redis_configured: boolean;
   model_configured: boolean;
+  storage_backend: string;
+  memory_backend: string;
+  fallback_active: boolean;
 };
 
 export type CodeFlowConfig = {
@@ -73,8 +76,11 @@ export type AuditEvent = {
 export type ServerEvent = {
   type: string;
   id?: string;
+  request_id?: string;
   session_id?: string;
   operation_id?: string;
+  approval_id?: string;
+  status?: string;
   kind?: string;
   path?: string;
   command?: string;
@@ -84,6 +90,7 @@ export type ServerEvent = {
   content?: string;
   output?: string;
   error?: string;
+  reason?: string;
   duration_ms?: number;
   confirmed?: boolean;
 };
@@ -91,6 +98,7 @@ export type ServerEvent = {
 export type ClientMessage = {
   type: string;
   id?: string;
+  request_id?: string;
   session_id?: string;
   input?: string;
   command?: string;
@@ -99,18 +107,56 @@ export type ClientMessage = {
   content?: string;
   append?: boolean;
   operation_id?: string;
+  approval_id?: string;
   allowed?: boolean;
+  reason?: string;
   plan_enabled?: boolean;
 };
 
 export type PendingApproval = {
+  approval_id?: string;
   operation_id: string;
+  request_id?: string;
+  status?: string;
   kind: string;
   path?: string;
   command?: string;
   preview?: string;
   risk?: string;
   timeout?: string;
+};
+
+export type ApprovalRecord = {
+  id: string;
+  operation_id: string;
+  session_id: string;
+  project_root: string;
+  kind: string;
+  path?: string;
+  command?: string;
+  preview?: string;
+  risk?: string;
+  timeout?: string;
+  request_id?: string;
+  status: "pending" | "approved" | "rejected";
+  decision_reason?: string;
+  decided_at?: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TaskEvent = {
+  id: string;
+  session_id?: string;
+  request_id?: string;
+  operation_id?: string;
+  approval_id?: string;
+  source: string;
+  level: string;
+  event_type: string;
+  message: string;
+  payload?: string;
+  created_at: string;
 };
 
 export type Skill = {

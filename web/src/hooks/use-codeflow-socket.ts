@@ -53,7 +53,11 @@ export function useCodeFlowSocket(sessionId?: string) {
 
   const send = useCallback((message: ClientMessage) => {
     if (socketRef.current?.readyState !== WebSocket.OPEN) return false;
-    socketRef.current.send(JSON.stringify(message));
+    const payload: ClientMessage = {
+      request_id: message.request_id ?? crypto.randomUUID(),
+      ...message,
+    };
+    socketRef.current.send(JSON.stringify(payload));
     return true;
   }, []);
 

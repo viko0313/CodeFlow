@@ -1,10 +1,12 @@
 import type {
+  ApprovalRecord,
   AuditEvent,
   CodeFlowConfig,
   CodeFlowSession,
   Health,
   McpManifest,
   SkillManifest,
+  TaskEvent,
   UploadedDocument,
 } from "@/lib/types";
 
@@ -55,6 +57,39 @@ export function deleteSession(id: string) {
 
 export async function getRecentAudit() {
   const payload = await request<{ events: AuditEvent[] }>("/audit/recent?limit=20");
+  return payload.events;
+}
+
+export async function getApprovals(params?: { status?: string; limit?: number }) {
+  const query = new URLSearchParams();
+  if (params?.status) query.set("status", params.status);
+  if (params?.limit) query.set("limit", String(params.limit));
+  const payload = await request<{ approvals: ApprovalRecord[] }>(`/approvals${query.size ? `?${query}` : ""}`);
+  return payload.approvals;
+}
+
+export function getApproval(id: string) {
+  return request<{ approval: ApprovalRecord }>(`/approvals/${id}`).then((payload) => payload.approval);
+}
+
+export function approveApproval(id: string) {
+  return request<{ approval: ApprovalRecord }>(`/approvals/${id}/approve`, { method: "POST" }).then(
+    (payload) => payload.approval,
+  );
+}
+
+export function rejectApproval(id: string, reason: string) {
+  return request<{ approval: ApprovalRecord }>(`/approvals/${id}/reject`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  }).then((payload) => payload.approval);
+}
+
+export async function getTaskEvents(params?: { sessionId?: string; limit?: number }) {
+  const query = new URLSearchParams();
+  if (params?.sessionId) query.set("session_id", params.sessionId);
+  if (params?.limit) query.set("limit", String(params.limit));
+  const payload = await request<{ events: TaskEvent[] }>(`/task-events${query.size ? `?${query}` : ""}`);
   return payload.events;
 }
 

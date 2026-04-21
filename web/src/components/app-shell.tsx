@@ -2,7 +2,13 @@ import Link from "next/link";
 import { signOut } from "@/auth";
 import { Button } from "@/components/ui/button";
 
-export function AppShell({ children, active }: { children: React.ReactNode; active: "dashboard" | "ide" }) {
+export function AppShell({
+  children,
+  active,
+}: {
+  children: React.ReactNode;
+  active: "dashboard" | "ide" | "approvals";
+}) {
   return (
     <main className="min-h-screen">
       <header className="sticky top-0 z-30 border-b border-[var(--line)] bg-white/95 backdrop-blur">
@@ -19,6 +25,9 @@ export function AppShell({ children, active }: { children: React.ReactNode; acti
             </Button>
             <Button asChild variant={active === "ide" ? "primary" : "ghost"} size="sm">
               <Link href="/ide">IDE</Link>
+            </Button>
+            <Button asChild variant={active === "approvals" ? "primary" : "ghost"} size="sm">
+              <Link href="/approvals">Approvals</Link>
             </Button>
             <form
               action={async () => {

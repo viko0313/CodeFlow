@@ -8,12 +8,14 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
   createSession,
+  getApprovals,
   getConfig,
   getHealth,
   getMcp,
   getRecentAudit,
   getSessions,
   getSkills,
+  getTaskEvents,
 } from "@/lib/codeflow-api";
 import { formatDateTime } from "@/lib/utils";
 
@@ -25,6 +27,16 @@ export function DashboardClient({ userName }: { userName: string }) {
   const skills = useQuery({ queryKey: ["skills"], queryFn: getSkills });
   const mcp = useQuery({ queryKey: ["mcp"], queryFn: getMcp });
   const audit = useQuery({ queryKey: ["audit"], queryFn: getRecentAudit, refetchInterval: 7000 });
+  const pendingApprovals = useQuery({
+    queryKey: ["approvals", "pending", "dashboard"],
+    queryFn: () => getApprovals({ status: "pending", limit: 50 }),
+    refetchInterval: 4000,
+  });
+  const taskEvents = useQuery({
+    queryKey: ["task-events", "dashboard"],
+    queryFn: () => getTaskEvents({ limit: 60 }),
+    refetchInterval: 7000,
+  });
   const create = useMutation({
     mutationFn: () => createSession(`CodeFlow ${new Date().toLocaleTimeString()}`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sessions"] }),
@@ -57,7 +69,7 @@ export function DashboardClient({ userName }: { userName: string }) {
         <div className="grid min-h-44 place-items-center rounded-lg bg-[var(--panel-strong)] p-5">
           <div className="grid w-full grid-cols-3 gap-3 text-center">
             <Metric icon={<Server />} label="API" value={health.data?.status ?? "checking"} />
-            <Metric icon={<Database />} label="Redis" value={health.data?.redis_configured ? "ready" : "missing"} />
+            <Metric icon={<Database />} label="Storage" value={health.data?.storage_backend ?? "unknown"} />
             <Metric icon={<Gauge />} label="Model" value={health.data?.model_configured ? "set" : "unset"} />
           </div>
         </div>
@@ -104,7 +116,24 @@ export function DashboardClient({ userName }: { userName: string }) {
               <Row label="Agent" value={config.data?.agent?.mode ?? "react"} />
               <Row label="Plan" value={config.data?.agent?.plan_enabled ? "enabled" : "toggle in IDE"} />
               <Row label="Project" value={health.data?.project_root ?? config.data?.project_root ?? "unknown"} />
+              <Row label="Memory" value={health.data?.memory_backend ?? "unknown"} />
+              <Row label="Fallback" value={health.data?.fallback_active ? "active" : "off"} />
             </dl>
+          </div>
+          <div className="rounded-lg border border-[var(--line)] bg-white p-5">
+            <h2 className="text-lg font-semibold">Approvals</h2>
+            <p className="mt-2 text-sm text-[var(--muted)]">
+              Pending: {pendingApprovals.data?.length ?? 0}
+            </p>
+            <p className="mt-1 text-sm text-[var(--muted)]">
+              Recent approval events:{" "}
+              {(taskEvents.data ?? []).filter((item) => item.event_type.startsWith("approval.")).length}
+            </p>
+            <div className="mt-3">
+              <Button asChild size="sm" variant="secondary">
+                <Link href="/approvals">Open approval center</Link>
+              </Button>
+            </div>
           </div>
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
             <div className="mb-3 flex items-center gap-2">

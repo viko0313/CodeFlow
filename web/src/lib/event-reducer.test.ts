@@ -19,13 +19,30 @@ describe("reduceServerEvent", () => {
   it("opens and clears permission approvals", () => {
     const pending = reduceServerEvent(initialEventState, {
       type: "permission.required",
+      approval_id: "apr_1",
       operation_id: "op_1",
       kind: "shell",
       command: "git status",
       preview: "$ git status",
     });
+    expect(pending.pendingApproval?.approval_id).toBe("apr_1");
     expect(pending.pendingApproval?.operation_id).toBe("op_1");
     const done = reduceServerEvent(pending, { type: "operation.done", id: "run1" });
     expect(done.pendingApproval).toBeUndefined();
+  });
+
+  it("clears pending approval after approval.updated", () => {
+    const pending = reduceServerEvent(initialEventState, {
+      type: "permission.required",
+      approval_id: "apr_1",
+      operation_id: "op_1",
+      kind: "shell",
+    });
+    const decided = reduceServerEvent(pending, {
+      type: "approval.updated",
+      approval_id: "apr_1",
+      status: "approved",
+    });
+    expect(decided.pendingApproval).toBeUndefined();
   });
 });

@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -8,25 +9,43 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import type { ClientMessage } from "@/lib/types";
 import { useUiStore } from "@/stores/use-ui-store";
 
 export function ApprovalDialog({ send }: { send: (message: ClientMessage) => boolean }) {
   const approval = useUiStore((store) => store.pendingApproval);
   const setPendingApproval = useUiStore((store) => store.setPendingApproval);
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState<string | undefined>();
 
-  function decide(allowed: boolean) {
+  function decide(allowed: boolean, fallbackReason?: string) {
     if (!approval) return;
+    const finalReason = (allowed ? "" : reason.trim() || fallbackReason || "").trim();
+    if (!allowed && !finalReason) {
+      setError("Reject reason is required.");
+      return;
+    }
     send({
       type: "permission.decide",
+      approval_id: approval.approval_id,
       operation_id: approval.operation_id,
       allowed,
+      reason: finalReason || undefined,
+      request_id: approval.request_id,
     });
+    setReason("");
+    setError(undefined);
     setPendingApproval(undefined);
   }
 
   return (
-    <Dialog open={Boolean(approval)} onOpenChange={(open) => !open && decide(false)}>
+    <Dialog
+      open={Boolean(approval)}
+      onOpenChange={(open) => {
+        if (!open) decide(false, "dismissed in approval dialog");
+      }}
+    >
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Approve {approval?.kind ?? "operation"}</DialogTitle>
@@ -42,6 +61,15 @@ export function ApprovalDialog({ send }: { send: (message: ClientMessage) => boo
           <pre className="max-h-72 overflow-auto rounded-lg bg-[var(--terminal)] p-3 text-xs text-white">
             {approval?.preview ?? "No preview supplied."}
           </pre>
+          <Input
+            placeholder="Reason required when denying"
+            value={reason}
+            onChange={(event) => {
+              setReason(event.target.value);
+              if (error) setError(undefined);
+            }}
+          />
+          {error ? <p className="text-xs text-[var(--danger)]">{error}</p> : null}
         </div>
         <div className="flex justify-end gap-2">
           <Button variant="secondary" onClick={() => decide(false)}>
