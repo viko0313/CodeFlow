@@ -1,0 +1,37 @@
+provider: "ark"
+model: "doubao-seed-1-8-251228"
+api_key: ${ARK_API_KEY}
+base_url: "https://ark.cn-beijing.volces.com/api/v3"
+temperature: 0.00
+storage:
+  postgres_dsn: ${CODEFLOW_POSTGRES_DSN}
+  redis_addr: "localhost:6379"
+  redis_password: ${CODEFLOW_REDIS_PASSWORD}
+  redis_db: 0
+permissions:
+  trusted_commands: []
+  trusted_dirs: []
+  writable_dirs: []
+runtime:
+  max_turns: 50
+  max_actions: 20
+agent:
+  mode: "react"
+  plan_enabled: false
+skills:
+  enabled: true
+  dirs:
+    - ".codeflow/skills"
+  preload: []
+  max_content_bytes: 6000
+mcp:
+  enabled: true
+  preload: true
+  config_files:
+    - ".codeflow/mcp.json"
+    - ".codeflow/mcp.yaml"
+  servers: []
+documents:
+  upload_dir: ".codeflow/uploads"
+  max_upload_bytes: 10485760
+  allowed_extensions: [".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".csv", ".html", ".pdf"]
