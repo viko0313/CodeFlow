@@ -1,0 +1,47 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+
+:root {
+  --background: #f6f7f9;
+  --foreground: #202124;
+  --panel: #ffffff;
+  --panel-strong: #eef2f1;
+  --line: #d8dee3;
+  --muted: #5f6b73;
+  --accent: #0f9f8f;
+  --accent-strong: #08796d;
+  --danger: #d64f45;
+  --warning: #b7791f;
+  --terminal: #171a1d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.xterm {
+  height: 100%;
+  padding: 12px;
+}

@@ -8,3 +8,8 @@ workspace/
 .codeflow/logs/
 .codeflow/checkpoints/
 .codeflow/runtime/
+web/.next/
+web/node_modules/
+web/.env.local
+web/coverage/
+web/tsconfig.tsbuildinfo
