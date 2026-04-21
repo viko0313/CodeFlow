@@ -7,12 +7,12 @@ import (
 )
 
 type SessionManager struct {
-	mu          sync.RWMutex
-	ctx         context.Context
-	sessionKey  string
-	profileKey  string
-	sessions    map[string]interface{}
-	profiles    map[string]string
+	mu         sync.RWMutex
+	ctx        context.Context
+	sessionKey string
+	profileKey string
+	sessions   map[string]interface{}
+	profiles   map[string]string
 }
 
 func (s *SessionManager) Init(_ interface{}) error {
@@ -50,12 +50,12 @@ func (s *SessionManager) DeleteSession(sessionID string) error {
 }
 
 func (s *SessionManager) FlushSession(sessionID string) error { return nil }
-func (s *SessionManager) BatchDeleteSessions([]string) error   { return nil }
+func (s *SessionManager) BatchDeleteSessions([]string) error  { return nil }
 func (s *SessionManager) BatchGetSessions([]interface{}, []interface{}) error {
 	return nil
 }
 func (s *SessionManager) GetSessionCount(context.Context) (int64, error) { return 0, nil }
-func (s *SessionManager) GetSessionList(string) ([]interface{}, error)    { return nil, nil }
+func (s *SessionManager) GetSessionList(string) ([]interface{}, error)   { return nil, nil }
 func (s *SessionManager) GetSessionData(string) (map[string]interface{}, error) {
 	return map[string]interface{}{}, nil
 }
@@ -85,8 +85,8 @@ func (s *SessionManager) ClearUserProfiles() error                     { return 
 func (s *SessionManager) UpdateUserPreferences(string, map[string]string) error {
 	return nil
 }
-func (s *SessionManager) DeleteUserPreferences(string) error                  { return nil }
-func (s *SessionManager) BatchDeleteUserPreferences([]string) error           { return nil }
+func (s *SessionManager) DeleteUserPreferences(string) error        { return nil }
+func (s *SessionManager) BatchDeleteUserPreferences([]string) error { return nil }
 func (s *SessionManager) BatchUpdateUserPreferences(context.Context, []string, map[string]interface{}) error {
 	return nil
 }
@@ -104,4 +104,3 @@ func (s *SessionManager) UpdateSessionData(context.Context, string, map[string]i
 	return nil
 }
 func (s *SessionManager) RefreshSession(context.Context, string) error { return nil }
-

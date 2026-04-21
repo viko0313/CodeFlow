@@ -10,9 +10,9 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/cloudwego/codeflow/internal/config"
-	"github.com/cloudwego/codeflow/internal/memory"
-	"github.com/cloudwego/codeflow/internal/tools"
+	"github.com/viko0313/CodeFlow/internal/config"
+	"github.com/viko0313/CodeFlow/internal/memory"
+	"github.com/viko0313/CodeFlow/internal/tools"
 )
 
 type fakeToolModel struct {

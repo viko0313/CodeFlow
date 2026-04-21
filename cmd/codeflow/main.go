@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/cloudwego/codeflow/internal/codeflow/cli"
+	"github.com/viko0313/CodeFlow/internal/codeflow/cli"
 )
 
 func main() {

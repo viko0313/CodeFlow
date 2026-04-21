@@ -6,4 +6,3 @@ type RedisConfig struct {
 	DB            int
 	SessionPrefix string
 }
-

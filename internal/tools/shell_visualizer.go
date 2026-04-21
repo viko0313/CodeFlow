@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudwego/codeflow/internal/config"
+	"github.com/viko0313/CodeFlow/internal/config"
 )
 
 type ToolInfo struct {

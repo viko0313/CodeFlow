@@ -1,6 +1,6 @@
 package config
 
-import legacy "github.com/cloudwego/codeflow/internal/config"
+import legacy "github.com/viko0313/CodeFlow/internal/config"
 
 func (c *Config) ToLegacy() *legacy.Config {
 	return &legacy.Config{

@@ -1,6 +1,6 @@
 package redis
 
-import "github.com/cloudwego/codeflow/internal/config"
+import "github.com/viko0313/CodeFlow/internal/config"
 
 func NewRedisClientFromConfig(_ *config.Config) (*SessionManager, error) {
 	sm := &SessionManager{}

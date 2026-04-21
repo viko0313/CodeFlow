@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cloudwego/codeflow/internal/bus"
-	"github.com/cloudwego/codeflow/internal/tools"
+	"github.com/viko0313/CodeFlow/internal/bus"
+	"github.com/viko0313/CodeFlow/internal/tools"
 )
 
 func TestTriggerDueTasksAndRepeat(t *testing.T) {

@@ -12,7 +12,7 @@ import (
 	"github.com/cloudwego/eino-ext/components/model/qwen"
 	"github.com/cloudwego/eino/components/model"
 
-	"github.com/cloudwego/codeflow/internal/config"
+	"github.com/viko0313/CodeFlow/internal/config"
 )
 
 type ProviderManager struct{}

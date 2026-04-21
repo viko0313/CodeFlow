@@ -1,6 +1,6 @@
 package redis
 
-import "github.com/cloudwego/codeflow/internal/config"
+import "github.com/viko0313/CodeFlow/internal/config"
 
 type Config struct {
 	Host          string
