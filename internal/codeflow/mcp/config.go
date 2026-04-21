@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	cfconfig "github.com/cloudwego/codeflow/internal/codeflow/config"
+	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
 	"go.yaml.in/yaml/v3"
 )
 

@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -11,9 +12,11 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/hertz-contrib/websocket"
 
-	"github.com/cloudwego/codeflow/internal/codeflow/engine"
-	"github.com/cloudwego/codeflow/internal/codeflow/permission"
-	cftools "github.com/cloudwego/codeflow/internal/codeflow/tools"
+	"github.com/viko0313/CodeFlow/internal/codeflow/engine"
+	"github.com/viko0313/CodeFlow/internal/codeflow/observability"
+	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
+	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
+	cftools "github.com/viko0313/CodeFlow/internal/codeflow/tools"
 )
 
 type clientMessage struct {
@@ -27,15 +30,21 @@ type clientMessage struct {
 	Content        string `json:"content,omitempty"`
 	Append         bool   `json:"append,omitempty"`
 	OperationID    string `json:"operation_id,omitempty"`
+	ApprovalID     string `json:"approval_id,omitempty"`
 	Allowed        bool   `json:"allowed,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
 	PlanEnabled    bool   `json:"plan_enabled,omitempty"`
 }
 
 type serverMessage struct {
 	Type           string `json:"type"`
 	ID             string `json:"id,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
 	SessionID      string `json:"session_id,omitempty"`
 	OperationID    string `json:"operation_id,omitempty"`
+	ApprovalID     string `json:"approval_id,omitempty"`
+	Status         string `json:"status,omitempty"`
 	Kind           string `json:"kind,omitempty"`
 	Path           string `json:"path,omitempty"`
 	Command        string `json:"command,omitempty"`
@@ -45,6 +54,7 @@ type serverMessage struct {
 	Content        string `json:"content,omitempty"`
 	Output         string `json:"output,omitempty"`
 	Error          string `json:"error,omitempty"`
+	Reason         string `json:"reason,omitempty"`
 	DurationMillis int64  `json:"duration_ms,omitempty"`
 	Confirmed      *bool  `json:"confirmed,omitempty"`
 }
@@ -52,10 +62,9 @@ type serverMessage struct {
 type wsClient struct {
 	server    *Server
 	conn      *websocket.Conn
+	requestID string
 	sessionID string
 	sendMu    sync.Mutex
-	pendingMu sync.Mutex
-	pending   map[string]chan permission.Decision
 	executor  *cftools.Executor
 }
 
@@ -67,6 +76,13 @@ var upgrader = websocket.HertzUpgrader{
 
 func (s *Server) handleWS(ctx context.Context, c *app.RequestContext) {
 	sessionID := strings.TrimSpace(c.Query("session_id"))
+	requestID := strings.TrimSpace(c.Query("request_id"))
+	if requestID == "" {
+		requestID = observability.RequestIDFromHertz(c)
+	}
+	if requestID == "" {
+		requestID = fmt.Sprintf("ws_%d", time.Now().UTC().UnixNano())
+	}
 	_ = upgrader.Upgrade(c, func(conn *websocket.Conn) {
 		if sessionID == "" && s.store != nil {
 			if session, err := s.store.GetActive(s.root); err == nil && session != nil {
@@ -76,11 +92,15 @@ func (s *Server) handleWS(ctx context.Context, c *app.RequestContext) {
 		client := &wsClient{
 			server:    s,
 			conn:      conn,
+			requestID: requestID,
 			sessionID: sessionID,
-			pending:   map[string]chan permission.Decision{},
 		}
 		client.executor = s.newWebExecutor(client.confirm)
-		client.send(serverMessage{Type: "session.updated", SessionID: sessionID})
+		client.send(serverMessage{
+			Type:      "session.updated",
+			SessionID: sessionID,
+			RequestID: requestID,
+		})
 		client.readLoop(ctx)
 	})
 }
@@ -88,10 +108,14 @@ func (s *Server) handleWS(ctx context.Context, c *app.RequestContext) {
 func (c *wsClient) readLoop(ctx context.Context) {
 	defer c.conn.Close()
 	for {
-		var msg clientMessage
-		if err := c.conn.ReadJSON(&msg); err != nil {
-			c.rejectAll("connection closed")
+		_, raw, err := c.conn.ReadMessage()
+		if err != nil {
 			return
+		}
+		msg, err := decodeClientMessage(raw)
+		if err != nil {
+			c.send(serverMessage{Type: "operation.error", Error: "invalid client message: " + err.Error(), RequestID: c.requestID})
+			continue
 		}
 		c.handle(ctx, msg)
 	}
@@ -102,7 +126,7 @@ func (c *wsClient) handle(ctx context.Context, msg clientMessage) {
 	case "ping":
 		c.send(serverMessage{Type: "pong", ID: msg.ID})
 	case "permission.decide":
-		c.resolvePermission(msg.OperationID, msg.Allowed)
+		c.decidePermission(msg)
 	case "session.switch":
 		c.switchSession(msg.SessionID)
 	case "chat.send":
@@ -128,7 +152,17 @@ func (c *wsClient) runChat(ctx context.Context, msg clientMessage) {
 		c.send(serverMessage{Type: "operation.error", ID: msg.ID, Error: "input is required"})
 		return
 	}
-	events, err := c.server.engine.Run(ctx, engine.Request{
+	runCtx := observability.WithSessionID(observability.WithRequestID(ctx, c.requestID), c.sessionID)
+	c.server.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID: c.sessionID,
+		RequestID: c.requestID,
+		Source:    "chat",
+		Level:     "info",
+		EventType: "chat.started",
+		Message:   "chat request started",
+		Payload:   fmt.Sprintf(`{"input_len":%d}`, len(input)),
+	})
+	events, err := c.server.engine.Run(runCtx, engine.Request{
 		SessionID:   c.sessionID,
 		ProjectRoot: c.server.root,
 		Input:       input,
@@ -137,6 +171,15 @@ func (c *wsClient) runChat(ctx context.Context, msg clientMessage) {
 		PlanEnabled: msg.PlanEnabled,
 	})
 	if err != nil {
+		c.server.emitTaskEvent(storage.CreateTaskEventInput{
+			SessionID: c.sessionID,
+			RequestID: c.requestID,
+			Source:    "chat",
+			Level:     "error",
+			EventType: "chat.failed",
+			Message:   "chat execution failed",
+			Payload:   fmt.Sprintf(`{"error":%q}`, err.Error()),
+		})
 		c.send(serverMessage{Type: "operation.error", ID: msg.ID, Error: err.Error()})
 		return
 	}
@@ -154,6 +197,15 @@ func (c *wsClient) runChat(ctx context.Context, msg clientMessage) {
 			c.send(serverMessage{Type: "operation.error", ID: msg.ID, Error: event.Content})
 		}
 	}
+	c.server.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID: c.sessionID,
+		RequestID: c.requestID,
+		Source:    "chat",
+		Level:     "info",
+		EventType: "chat.completed",
+		Message:   "chat request completed",
+		Payload:   fmt.Sprintf(`{"session_id":%q}`, observability.SessionIDFromContext(runCtx)),
+	})
 }
 
 func (c *wsClient) runTerminal(ctx context.Context, msg clientMessage) {
@@ -166,6 +218,7 @@ func (c *wsClient) runTerminal(ctx context.Context, msg clientMessage) {
 		ProjectRoot: c.server.root,
 		Command:     msg.Command,
 		Timeout:     timeout,
+		RequestID:   c.requestID,
 	}, c.sessionID)
 	if result.Output != "" {
 		c.send(serverMessage{Type: "terminal.output", ID: msg.ID, Output: result.Output})
@@ -189,6 +242,7 @@ func (c *wsClient) writeFile(ctx context.Context, msg clientMessage) {
 		Path:        msg.Path,
 		Content:     msg.Content,
 		Append:      msg.Append,
+		RequestID:   c.requestID,
 	}, c.sessionID)
 	c.sendOperationResult(msg.ID, result, err)
 }
@@ -212,18 +266,18 @@ func (c *wsClient) switchSession(sessionID string) {
 }
 
 func (c *wsClient) confirm(ctx context.Context, op permission.Operation) (permission.Decision, error) {
-	ch := make(chan permission.Decision, 1)
-	c.pendingMu.Lock()
-	c.pending[op.ID] = ch
-	c.pendingMu.Unlock()
-	defer func() {
-		c.pendingMu.Lock()
-		delete(c.pending, op.ID)
-		c.pendingMu.Unlock()
-	}()
+	if c.server.approvals == nil || !c.server.approvals.Enabled() {
+		return permission.Decision{Allowed: false, Reason: "approval service unavailable"}, nil
+	}
+	if strings.TrimSpace(op.ApprovalID) == "" {
+		return permission.Decision{Allowed: false, Reason: "approval record missing"}, nil
+	}
 	c.send(serverMessage{
 		Type:        "permission.required",
+		RequestID:   c.requestID,
 		OperationID: op.ID,
+		ApprovalID:  op.ApprovalID,
+		Status:      string(storage.ApprovalStatusPending),
 		Kind:        string(op.Kind),
 		Path:        op.Path,
 		Command:     op.Command,
@@ -231,36 +285,109 @@ func (c *wsClient) confirm(ctx context.Context, op permission.Operation) (permis
 		Risk:        op.Risk,
 		Timeout:     op.Timeout,
 	})
-	select {
-	case <-ctx.Done():
-		return permission.Decision{Allowed: false, Reason: "cancelled"}, ctx.Err()
-	case decision := <-ch:
-		return decision, nil
+	c.server.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID:   c.sessionID,
+		RequestID:   c.requestID,
+		OperationID: op.ID,
+		ApprovalID:  op.ApprovalID,
+		Source:      "ws",
+		Level:       "info",
+		EventType:   "approval.requested",
+		Message:     "permission request sent to websocket client",
+		Payload:     fmt.Sprintf(`{"kind":%q}`, op.Kind),
+	})
+	allowed, reason, err := c.server.approvals.WaitForDecision(ctx, op.ApprovalID)
+	if err != nil {
+		return permission.Decision{Allowed: false, Reason: "approval wait failed"}, err
 	}
+	status := storage.ApprovalStatusRejected
+	if allowed {
+		status = storage.ApprovalStatusApproved
+	}
+	c.send(serverMessage{
+		Type:        "approval.updated",
+		RequestID:   c.requestID,
+		OperationID: op.ID,
+		ApprovalID:  op.ApprovalID,
+		Status:      string(status),
+		Reason:      reason,
+	})
+	return permission.Decision{Allowed: allowed, Reason: reason}, nil
 }
 
-func (c *wsClient) resolvePermission(operationID string, allowed bool) {
-	c.pendingMu.Lock()
-	ch := c.pending[operationID]
-	c.pendingMu.Unlock()
-	if ch == nil {
-		c.send(serverMessage{Type: "operation.error", OperationID: operationID, Error: "permission request not found"})
+func (c *wsClient) decidePermission(msg clientMessage) {
+	if c.server.approvals == nil || !c.server.approvals.Enabled() {
+		c.send(serverMessage{Type: "operation.error", Error: "approval service unavailable", RequestID: c.requestID})
 		return
 	}
-	reason := "web user denied"
-	if allowed {
-		reason = "web user approved"
+	reason := strings.TrimSpace(msg.Reason)
+	approvalID := strings.TrimSpace(msg.ApprovalID)
+	if approvalID == "" && strings.TrimSpace(msg.OperationID) != "" {
+		store := c.server.approvals.Store()
+		if store != nil {
+			record, err := store.GetApprovalByOperationID(strings.TrimSpace(msg.OperationID))
+			if err == nil && record != nil {
+				approvalID = record.ID
+			}
+		}
 	}
-	ch <- permission.Decision{Allowed: allowed, Reason: reason}
+	if approvalID == "" {
+		c.send(serverMessage{Type: "operation.error", Error: "approval_id is required", RequestID: c.requestID})
+		return
+	}
+	if !msg.Allowed && reason == "" {
+		c.send(serverMessage{
+			Type:       "operation.error",
+			ApprovalID: approvalID,
+			Error:      "reject reason is required",
+			RequestID:  c.requestID,
+		})
+		return
+	}
+	record, err := c.server.approvals.Decide(approvalID, msg.Allowed, reason)
+	if err != nil {
+		c.send(serverMessage{
+			Type:       "operation.error",
+			ApprovalID: approvalID,
+			Error:      err.Error(),
+			RequestID:  c.requestID,
+		})
+		return
+	}
+	c.server.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID:   record.SessionID,
+		RequestID:   c.requestID,
+		OperationID: record.OperationID,
+		ApprovalID:  record.ID,
+		Source:      "ws",
+		Level:       "info",
+		EventType:   "approval.decided",
+		Message:     "approval decided via websocket",
+		Payload:     fmt.Sprintf(`{"status":%q,"reason":%q}`, record.Status, record.DecisionReason),
+	})
+	c.send(serverMessage{
+		Type:        "approval.updated",
+		RequestID:   c.requestID,
+		OperationID: record.OperationID,
+		ApprovalID:  record.ID,
+		Status:      string(record.Status),
+		Reason:      record.DecisionReason,
+	})
 }
 
-func (c *wsClient) rejectAll(reason string) {
-	c.pendingMu.Lock()
-	defer c.pendingMu.Unlock()
-	for id, ch := range c.pending {
-		ch <- permission.Decision{Allowed: false, Reason: reason}
-		delete(c.pending, id)
+func decodeClientMessage(raw []byte) (clientMessage, error) {
+	var msg clientMessage
+	if err := json.Unmarshal(raw, &msg); err == nil {
+		return msg, nil
 	}
+	repaired := repairJSONPayload(string(raw))
+	if repaired == "" {
+		return clientMessage{}, fmt.Errorf("invalid json payload")
+	}
+	if err := json.Unmarshal([]byte(repaired), &msg); err != nil {
+		return clientMessage{}, err
+	}
+	return msg, nil
 }
 
 func (c *wsClient) sendOperationResult(id string, result cftools.Result, err error) {
@@ -269,6 +396,8 @@ func (c *wsClient) sendOperationResult(id string, result cftools.Result, err err
 		c.send(serverMessage{
 			Type:           "operation.error",
 			ID:             id,
+			RequestID:      c.requestID,
+			ApprovalID:     result.ApprovalID,
 			Error:          err.Error(),
 			Output:         result.Output,
 			DurationMillis: result.Duration.Milliseconds(),
@@ -279,6 +408,8 @@ func (c *wsClient) sendOperationResult(id string, result cftools.Result, err err
 	c.send(serverMessage{
 		Type:           "operation.done",
 		ID:             id,
+		RequestID:      c.requestID,
+		ApprovalID:     result.ApprovalID,
 		Output:         result.Output,
 		DurationMillis: result.Duration.Milliseconds(),
 		Confirmed:      &confirmed,
@@ -346,4 +477,26 @@ func simpleDiff(old, next string) string {
 		}
 	}
 	return b.String()
+}
+
+func repairJSONPayload(payload string) string {
+	value := strings.TrimSpace(payload)
+	if value == "" {
+		return ""
+	}
+	value = strings.TrimPrefix(value, "```json")
+	value = strings.TrimPrefix(value, "```")
+	value = strings.TrimSuffix(value, "```")
+	value = strings.TrimSpace(value)
+	start := strings.IndexByte(value, '{')
+	end := strings.LastIndexByte(value, '}')
+	if start >= 0 && end >= start {
+		value = value[start : end+1]
+	}
+	value = strings.TrimSpace(value)
+	for strings.HasSuffix(value, ",") {
+		value = strings.TrimSuffix(value, ",")
+		value = strings.TrimSpace(value)
+	}
+	return value
 }

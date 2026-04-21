@@ -22,6 +22,8 @@ const (
 
 type Operation struct {
 	ID          string
+	ApprovalID  string
+	RequestID   string
 	Kind        OperationKind
 	ProjectRoot string
 	Path        string
@@ -42,6 +44,7 @@ type Gate struct {
 	trustedCommands []string
 	trustedDirs     []string
 	writableDirs    []string
+	forceApproval   bool
 	confirm         Confirmer
 }
 
@@ -49,6 +52,7 @@ type Options struct {
 	TrustedCommands []string
 	TrustedDirs     []string
 	WritableDirs    []string
+	ForceApproval   bool
 	Confirmer       Confirmer
 }
 
@@ -61,6 +65,7 @@ func NewGate(opts Options) *Gate {
 		trustedCommands: opts.TrustedCommands,
 		trustedDirs:     opts.TrustedDirs,
 		writableDirs:    opts.WritableDirs,
+		forceApproval:   opts.ForceApproval,
 		confirm:         confirm,
 	}
 }
@@ -81,11 +86,11 @@ func (g *Gate) Review(ctx context.Context, op Operation) (Decision, error) {
 		if err := ValidateShellCommand(op.Command); err != nil {
 			return Decision{Allowed: false, Reason: err.Error()}, nil
 		}
-		if g.commandTrusted(op.Command) {
+		if !g.forceApproval && g.commandTrusted(op.Command) {
 			return Decision{Allowed: true, Reason: "trusted command"}, nil
 		}
 	}
-	if op.Kind == OperationWriteFile && withinAny(op.ProjectRoot, op.Path, g.trustedDirs) {
+	if op.Kind == OperationWriteFile && !g.forceApproval && withinAny(op.ProjectRoot, op.Path, g.trustedDirs) {
 		return Decision{Allowed: true, Reason: "trusted directory"}, nil
 	}
 	return g.confirm(ctx, op)

@@ -16,9 +16,10 @@ import (
 	hertzserver "github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/gorilla/websocket"
 
-	cfconfig "github.com/cloudwego/codeflow/internal/codeflow/config"
-	"github.com/cloudwego/codeflow/internal/codeflow/engine"
-	cfsession "github.com/cloudwego/codeflow/internal/codeflow/session"
+	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
+	"github.com/viko0313/CodeFlow/internal/codeflow/engine"
+	cfsession "github.com/viko0313/CodeFlow/internal/codeflow/session"
+	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
 )
 
 func TestSessionAPIListAndSwitch(t *testing.T) {
@@ -78,7 +79,10 @@ func TestWebSocketPermissionApproveRunsShell(t *testing.T) {
 	if required.OperationID == "" {
 		t.Fatal("permission.required did not include operation_id")
 	}
-	if err := conn.WriteJSON(clientMessage{Type: "permission.decide", OperationID: required.OperationID, Allowed: true}); err != nil {
+	if required.ApprovalID == "" {
+		t.Fatal("permission.required did not include approval_id")
+	}
+	if err := conn.WriteJSON(clientMessage{Type: "permission.decide", ApprovalID: required.ApprovalID, Allowed: true}); err != nil {
 		t.Fatal(err)
 	}
 	output := readUntil(t, conn, "terminal.output")
@@ -106,6 +110,82 @@ func TestWebSocketBlockedShellCommand(t *testing.T) {
 	event := readUntil(t, conn, "operation.error")
 	if !strings.Contains(event.Error, "blocked") {
 		t.Fatalf("expected blocked command error, got %q", event.Error)
+	}
+}
+
+func TestApprovalsAPIListAndReject(t *testing.T) {
+	store := newFakeStore(t.TempDir())
+	server := NewServer(Dependencies{ProjectRoot: store.root, Config: testConfig(), Store: store})
+	baseURL, cleanup := startHertzTestServer(t, server)
+	defer cleanup()
+
+	record, err := store.CreateApproval(storage.CreateApprovalInput{
+		OperationID: "op_api_1",
+		SessionID:   "s1",
+		ProjectRoot: store.root,
+		Kind:        "shell",
+		Command:     "git status",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Get(baseURL + "/api/approvals?status=pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list approvals status = %d", resp.StatusCode)
+	}
+	var listPayload struct {
+		Approvals []storage.ApprovalRecord `json:"approvals"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(listPayload.Approvals) != 1 || listPayload.Approvals[0].ID != record.ID {
+		t.Fatalf("unexpected approvals payload: %+v", listPayload)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/approvals/"+record.ID+"/reject", strings.NewReader(`{"reason":"unsafe"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reject approval status = %d", resp.StatusCode)
+	}
+
+	rejected, err := store.GetApproval(record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejected == nil || rejected.Status != storage.ApprovalStatusRejected {
+		t.Fatalf("approval was not rejected: %+v", rejected)
+	}
+
+	resp, err = http.Get(baseURL + "/api/task-events?limit=20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("task events status = %d", resp.StatusCode)
+	}
+	var eventsPayload struct {
+		Events []storage.TaskEvent `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&eventsPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(eventsPayload.Events) == 0 {
+		t.Fatal("expected task events after reject action")
 	}
 }
 
@@ -276,9 +356,12 @@ func (fakeEngine) Run(ctx context.Context, req engine.Request) (<-chan engine.Ev
 }
 
 type fakeStore struct {
-	mu       sync.Mutex
-	root     string
-	sessions []cfsession.Session
+	mu            sync.Mutex
+	root          string
+	sessions      []cfsession.Session
+	approvals     map[string]storage.ApprovalRecord
+	approvalOrder []string
+	taskEvents    []storage.TaskEvent
 }
 
 func newFakeStore(root string) *fakeStore {
@@ -289,6 +372,7 @@ func newFakeStore(root string) *fakeStore {
 			{ID: "s1", ProjectRoot: root, Title: "One", Active: true, CreatedAt: now, UpdatedAt: now},
 			{ID: "s2", ProjectRoot: root, Title: "Two", Active: false, CreatedAt: now, UpdatedAt: now},
 		},
+		approvals: map[string]storage.ApprovalRecord{},
 	}
 }
 
@@ -368,3 +452,153 @@ func (s *fakeStore) Delete(projectRoot, sessionID string) error {
 }
 
 func (s *fakeStore) Close() {}
+
+func (s *fakeStore) CreateApproval(input storage.CreateApprovalInput) (*storage.ApprovalRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	id := input.ID
+	if id == "" {
+		id = fmt.Sprintf("apr_%d", len(s.approvals)+1)
+	}
+	record := storage.ApprovalRecord{
+		ID:          id,
+		OperationID: input.OperationID,
+		SessionID:   input.SessionID,
+		ProjectRoot: input.ProjectRoot,
+		Kind:        input.Kind,
+		Path:        input.Path,
+		Command:     input.Command,
+		Preview:     input.Preview,
+		Risk:        input.Risk,
+		Timeout:     input.Timeout,
+		RequestID:   input.RequestID,
+		Status:      storage.ApprovalStatusPending,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	s.approvals[id] = record
+	s.approvalOrder = append([]string{id}, s.approvalOrder...)
+	copy := record
+	return &copy, nil
+}
+
+func (s *fakeStore) GetApproval(id string) (*storage.ApprovalRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.approvals[id]
+	if !ok {
+		return nil, nil
+	}
+	copy := record
+	return &copy, nil
+}
+
+func (s *fakeStore) GetApprovalByOperationID(operationID string) (*storage.ApprovalRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range s.approvalOrder {
+		record := s.approvals[id]
+		if record.OperationID == operationID {
+			copy := record
+			return &copy, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *fakeStore) ListApprovals(opts storage.ListApprovalsOptions) ([]storage.ApprovalRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	status := strings.TrimSpace(opts.Status)
+	out := make([]storage.ApprovalRecord, 0, limit)
+	for _, id := range s.approvalOrder {
+		record := s.approvals[id]
+		if status != "" && string(record.Status) != status {
+			continue
+		}
+		out = append(out, record)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) DecideApproval(id string, allowed bool, reason string) (*storage.ApprovalRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.approvals[id]
+	if !ok {
+		return nil, nil
+	}
+	if record.Status != storage.ApprovalStatusPending {
+		return nil, nil
+	}
+	status := storage.ApprovalStatusRejected
+	if allowed {
+		status = storage.ApprovalStatusApproved
+	}
+	now := time.Now().UTC()
+	record.Status = status
+	record.DecisionReason = reason
+	record.DecidedAt = &now
+	record.UpdatedAt = now
+	s.approvals[id] = record
+	copy := record
+	return &copy, nil
+}
+
+func (s *fakeStore) CreateTaskEvent(input storage.CreateTaskEventInput) (*storage.TaskEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := input.ID
+	if id == "" {
+		id = fmt.Sprintf("evt_%d", len(s.taskEvents)+1)
+	}
+	createdAt := input.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	item := storage.TaskEvent{
+		ID:          id,
+		SessionID:   input.SessionID,
+		RequestID:   input.RequestID,
+		OperationID: input.OperationID,
+		ApprovalID:  input.ApprovalID,
+		Source:      input.Source,
+		Level:       input.Level,
+		EventType:   input.EventType,
+		Message:     input.Message,
+		Payload:     input.Payload,
+		CreatedAt:   createdAt,
+	}
+	s.taskEvents = append([]storage.TaskEvent{item}, s.taskEvents...)
+	copy := item
+	return &copy, nil
+}
+
+func (s *fakeStore) ListTaskEvents(opts storage.ListTaskEventsOptions) ([]storage.TaskEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	sessionID := strings.TrimSpace(opts.SessionID)
+	out := make([]storage.TaskEvent, 0, limit)
+	for _, item := range s.taskEvents {
+		if sessionID != "" && item.SessionID != sessionID {
+			continue
+		}
+		out = append(out, item)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}

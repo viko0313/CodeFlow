@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,8 +14,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/cloudwego/codeflow/internal/codeflow/audit"
-	"github.com/cloudwego/codeflow/internal/codeflow/permission"
+	"github.com/viko0313/CodeFlow/internal/codeflow/audit"
+	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
+	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
 )
 
 type Operation struct {
@@ -25,26 +27,31 @@ type Operation struct {
 	Append      bool
 	Command     string
 	Timeout     time.Duration
+	RequestID   string
 }
 
 type Result struct {
-	Output    string
-	Duration  time.Duration
-	Confirmed bool
+	Output     string
+	Duration   time.Duration
+	Confirmed  bool
+	ApprovalID string
 }
 
 type Executor struct {
-	gate    *permission.Gate
-	auditor *audit.Logger
+	gate      *permission.Gate
+	auditor   *audit.Logger
+	approvals storage.ApprovalStore
+	events    storage.TaskEventStore
 }
 
-func NewExecutor(gate *permission.Gate, auditor *audit.Logger) *Executor {
-	return &Executor{gate: gate, auditor: auditor}
+func NewExecutor(gate *permission.Gate, auditor *audit.Logger, approvals storage.ApprovalStore, events storage.TaskEventStore) *Executor {
+	return &Executor{gate: gate, auditor: auditor, approvals: approvals, events: events}
 }
 
 func (e *Executor) Execute(ctx context.Context, op Operation, sessionID string) (Result, error) {
 	start := time.Now()
 	id := "op_" + uuid.NewString()[:8]
+	approvalID := ""
 	preview := ""
 	risk := "medium"
 	if op.Kind == permission.OperationWriteFile {
@@ -61,8 +68,39 @@ func (e *Executor) Execute(ctx context.Context, op Operation, sessionID string) 
 		preview = fmt.Sprintf("$ %s", op.Command)
 		risk = shellRisk(op.Command)
 	}
+	if e.approvals != nil {
+		approval, err := e.approvals.CreateApproval(storage.CreateApprovalInput{
+			OperationID: id,
+			SessionID:   sessionID,
+			ProjectRoot: op.ProjectRoot,
+			Kind:        string(op.Kind),
+			Path:        op.Path,
+			Command:     op.Command,
+			Preview:     preview,
+			Risk:        risk,
+			Timeout:     op.Timeout.String(),
+			RequestID:   op.RequestID,
+		})
+		if err != nil {
+			return Result{}, err
+		}
+		approvalID = approval.ID
+		e.emitTaskEvent(storage.CreateTaskEventInput{
+			SessionID:   sessionID,
+			RequestID:   op.RequestID,
+			OperationID: id,
+			ApprovalID:  approvalID,
+			Source:      "executor",
+			Level:       "info",
+			EventType:   "approval.requested",
+			Message:     "operation is waiting for approval",
+			Payload:     toJSON(map[string]any{"kind": op.Kind, "path": op.Path, "command": op.Command}),
+		})
+	}
 	decision, err := e.gate.Review(ctx, permission.Operation{
 		ID:          id,
+		ApprovalID:  approvalID,
+		RequestID:   op.RequestID,
 		Kind:        op.Kind,
 		ProjectRoot: op.ProjectRoot,
 		Path:        op.Path,
@@ -72,20 +110,61 @@ func (e *Executor) Execute(ctx context.Context, op Operation, sessionID string) 
 		Timeout:     op.Timeout.String(),
 	})
 	if err != nil {
+		if e.approvals != nil && approvalID != "" {
+			_, _ = e.approvals.DecideApproval(approvalID, false, err.Error())
+		}
+		e.emitTaskEvent(storage.CreateTaskEventInput{
+			SessionID:   sessionID,
+			RequestID:   op.RequestID,
+			OperationID: id,
+			ApprovalID:  approvalID,
+			Source:      "executor",
+			Level:       "error",
+			EventType:   "approval.failed",
+			Message:     "approval review failed",
+			Payload:     toJSON(map[string]any{"error": err.Error()}),
+		})
 		return Result{}, err
 	}
-	confirmed := decision.Allowed
-	defer e.record(sessionID, op, id, start, confirmed, decision.Reason)
-	if !decision.Allowed {
-		return Result{Confirmed: false, Duration: time.Since(start)}, fmt.Errorf("operation denied: %s", decision.Reason)
+	if e.approvals != nil && approvalID != "" {
+		_, _ = e.approvals.DecideApproval(approvalID, decision.Allowed, decision.Reason)
 	}
+	e.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID:   sessionID,
+		RequestID:   op.RequestID,
+		OperationID: id,
+		ApprovalID:  approvalID,
+		Source:      "executor",
+		Level:       "info",
+		EventType:   "approval.decided",
+		Message:     "approval decision recorded",
+		Payload:     toJSON(map[string]any{"allowed": decision.Allowed, "reason": decision.Reason}),
+	})
+	confirmed := decision.Allowed
+	defer e.record(sessionID, op, id, approvalID, start, confirmed, decision.Reason)
+	if !decision.Allowed {
+		return Result{Confirmed: false, Duration: time.Since(start), ApprovalID: approvalID}, fmt.Errorf("operation denied: %s", decision.Reason)
+	}
+	e.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID:   sessionID,
+		RequestID:   op.RequestID,
+		OperationID: id,
+		ApprovalID:  approvalID,
+		Source:      "executor",
+		Level:       "info",
+		EventType:   "execution.started",
+		Message:     "operation execution started",
+		Payload:     toJSON(map[string]any{"kind": op.Kind}),
+	})
 	switch op.Kind {
 	case permission.OperationWriteFile:
 		out, err := e.writeFile(op)
-		return Result{Output: out, Duration: time.Since(start), Confirmed: true}, err
+		e.emitExecutionEvent(sessionID, op, id, approvalID, err)
+		return Result{Output: out, Duration: time.Since(start), Confirmed: true, ApprovalID: approvalID}, err
 	case permission.OperationShell:
 		out, err := e.shell(ctx, op)
-		return Result{Output: out, Duration: time.Since(start), Confirmed: true}, err
+		e.emitExecutionEvent(sessionID, op, id, approvalID, err)
+		return Result{Output: out, Duration: time.Since(start), Confirmed: true, ApprovalID: approvalID}, err
 	default:
 		return Result{}, fmt.Errorf("unsupported operation kind: %s", op.Kind)
 	}
@@ -150,21 +229,71 @@ func (e *Executor) shell(ctx context.Context, op Operation) (string, error) {
 	return out, nil
 }
 
-func (e *Executor) record(sessionID string, op Operation, operationID string, start time.Time, confirmed bool, result string) {
+func (e *Executor) record(sessionID string, op Operation, operationID, approvalID string, start time.Time, confirmed bool, result string) {
 	if e.auditor == nil {
+	} else {
+		_ = e.auditor.Record(audit.Event{
+			SessionID:     sessionID,
+			ProjectRoot:   op.ProjectRoot,
+			OperationID:   operationID,
+			Event:         string(op.Kind),
+			ToolName:      string(op.Kind),
+			ArgsSummary:   argsSummary(op),
+			ResultSummary: truncate(result, 200),
+			DurationMS:    time.Since(start).Milliseconds(),
+			Confirmed:     &confirmed,
+		})
+	}
+	e.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID:   sessionID,
+		RequestID:   op.RequestID,
+		OperationID: operationID,
+		ApprovalID:  approvalID,
+		Source:      "executor",
+		Level:       "info",
+		EventType:   "audit.recorded",
+		Message:     "audit event written",
+		Payload:     toJSON(map[string]any{"confirmed": confirmed, "result": truncate(result, 120)}),
+	})
+}
+
+func (e *Executor) emitExecutionEvent(sessionID string, op Operation, operationID, approvalID string, execErr error) {
+	level := "info"
+	eventType := "execution.completed"
+	message := "operation execution completed"
+	payload := map[string]any{"kind": op.Kind}
+	if execErr != nil {
+		level = "error"
+		eventType = "execution.failed"
+		message = "operation execution failed"
+		payload["error"] = execErr.Error()
+	}
+	e.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID:   sessionID,
+		RequestID:   op.RequestID,
+		OperationID: operationID,
+		ApprovalID:  approvalID,
+		Source:      "executor",
+		Level:       level,
+		EventType:   eventType,
+		Message:     message,
+		Payload:     toJSON(payload),
+	})
+}
+
+func (e *Executor) emitTaskEvent(input storage.CreateTaskEventInput) {
+	if e.events == nil {
 		return
 	}
-	_ = e.auditor.Record(audit.Event{
-		SessionID:     sessionID,
-		ProjectRoot:   op.ProjectRoot,
-		OperationID:   operationID,
-		Event:         string(op.Kind),
-		ToolName:      string(op.Kind),
-		ArgsSummary:   argsSummary(op),
-		ResultSummary: truncate(result, 200),
-		DurationMS:    time.Since(start).Milliseconds(),
-		Confirmed:     &confirmed,
-	})
+	_, _ = e.events.CreateTaskEvent(input)
+}
+
+func toJSON(v map[string]any) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
 }
 
 func buildDiff(path, newContent string, appendMode bool) string {

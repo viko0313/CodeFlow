@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cloudwego/codeflow/internal/codeflow/permission"
+	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
 )
 
 func TestExecutorDeniedWriteDoesNotTouchDisk(t *testing.T) {
@@ -15,7 +15,7 @@ func TestExecutorDeniedWriteDoesNotTouchDisk(t *testing.T) {
 	gate := permission.NewGate(permission.Options{Confirmer: func(context.Context, permission.Operation) (permission.Decision, error) {
 		return permission.Decision{Allowed: false, Reason: "test denied"}, nil
 	}})
-	executor := NewExecutor(gate, nil)
+	executor := NewExecutor(gate, nil, nil, nil)
 	_, err := executor.Execute(context.Background(), Operation{Kind: permission.OperationWriteFile, ProjectRoot: dir, Path: "out.txt", Content: "nope"}, "s1")
 	if err == nil {
 		t.Fatal("expected denial error")
@@ -32,7 +32,7 @@ func TestExecutorApprovedWriteCreatesFile(t *testing.T) {
 		preview = op.Preview
 		return permission.Decision{Allowed: true, Reason: "ok"}, nil
 	}})
-	executor := NewExecutor(gate, nil)
+	executor := NewExecutor(gate, nil, nil, nil)
 	if _, err := executor.Execute(context.Background(), Operation{Kind: permission.OperationWriteFile, ProjectRoot: dir, Path: "out.txt", Content: "hello\n"}, "s1"); err != nil {
 		t.Fatal(err)
 	}

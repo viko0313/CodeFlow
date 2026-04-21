@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,18 +18,20 @@ import (
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
 
-	"github.com/cloudwego/codeflow/internal/codeflow/audit"
-	cfconfig "github.com/cloudwego/codeflow/internal/codeflow/config"
-	"github.com/cloudwego/codeflow/internal/codeflow/documents"
-	"github.com/cloudwego/codeflow/internal/codeflow/engine"
-	"github.com/cloudwego/codeflow/internal/codeflow/mcp"
-	cfmemory "github.com/cloudwego/codeflow/internal/codeflow/memory"
-	"github.com/cloudwego/codeflow/internal/codeflow/permission"
-	cfsession "github.com/cloudwego/codeflow/internal/codeflow/session"
-	"github.com/cloudwego/codeflow/internal/codeflow/skills"
-	"github.com/cloudwego/codeflow/internal/codeflow/storage"
-	cftools "github.com/cloudwego/codeflow/internal/codeflow/tools"
-	"github.com/cloudwego/codeflow/internal/codeflow/version"
+	"github.com/viko0313/CodeFlow/internal/codeflow/approval"
+	"github.com/viko0313/CodeFlow/internal/codeflow/audit"
+	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
+	"github.com/viko0313/CodeFlow/internal/codeflow/documents"
+	"github.com/viko0313/CodeFlow/internal/codeflow/engine"
+	"github.com/viko0313/CodeFlow/internal/codeflow/mcp"
+	cfmemory "github.com/viko0313/CodeFlow/internal/codeflow/memory"
+	"github.com/viko0313/CodeFlow/internal/codeflow/observability"
+	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
+	cfsession "github.com/viko0313/CodeFlow/internal/codeflow/session"
+	"github.com/viko0313/CodeFlow/internal/codeflow/skills"
+	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
+	cftools "github.com/viko0313/CodeFlow/internal/codeflow/tools"
+	"github.com/viko0313/CodeFlow/internal/codeflow/version"
 )
 
 type Options struct {
@@ -49,6 +52,13 @@ type Server struct {
 	mcp     mcp.Manifest
 	docs    *documents.Store
 	uploads []documents.UploadedDocument
+
+	logger         *slog.Logger
+	approvals      *approval.Service
+	taskEvents     storage.TaskEventStore
+	storageBackend string
+	memoryBackend  string
+	fallbackActive bool
 }
 
 type Dependencies struct {
@@ -60,6 +70,11 @@ type Dependencies struct {
 	Auditor     *audit.Logger
 	AgentMD     string
 	DataDir     string
+	Logger      *slog.Logger
+
+	StorageBackend string
+	MemoryBackend  string
+	FallbackActive bool
 }
 
 func Run(ctx context.Context, opts Options) error {
@@ -71,16 +86,26 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	store, err := storage.NewPostgresSessionStore(ctx, cfg.Storage.PostgresDSN)
+	logger := observability.NewLogger("codeflow-web")
+	store, storageBackend, storageFallback, err := storage.OpenSessionStoreWithFallback(ctx, cfg.Storage.PostgresDSN, cfg.DataDir)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	memory, err := cfmemory.NewRedisShortTermMemory(ctx, cfg.Storage.RedisAddr, cfg.Storage.RedisPass, cfg.Storage.RedisDB)
+	memory, memoryBackend, memoryFallback, err := cfmemory.OpenShortTermMemoryWithFallback(ctx, cfg.Storage.RedisAddr, cfg.Storage.RedisPass, cfg.Storage.RedisDB)
 	if err != nil {
 		return err
 	}
 	defer memory.Close()
+	fallbackActive := storageFallback || memoryFallback
+	if fallbackActive {
+		logger.WarnContext(ctx, "runtime fallback activated",
+			slog.String("component", "runtime"),
+			slog.String("event", "runtime.fallback"),
+			slog.String("storage_backend", storageBackend),
+			slog.String("memory_backend", memoryBackend),
+		)
+	}
 	agentMD := readAgentMD(root)
 	session, err := store.GetActive(root)
 	if err != nil {
@@ -112,7 +137,19 @@ func Run(ctx context.Context, opts Options) error {
 		Auditor:     auditor,
 		AgentMD:     agentMD,
 		DataDir:     cfg.DataDir,
+		Logger:      logger,
+
+		StorageBackend: storageBackend,
+		MemoryBackend:  memoryBackend,
+		FallbackActive: fallbackActive,
 	})
+	s.logger.InfoContext(ctx, "web server configured",
+		slog.String("component", "runtime"),
+		slog.String("event", "server.starting"),
+		slog.String("storage_backend", storageBackend),
+		slog.String("memory_backend", memoryBackend),
+		slog.Bool("fallback_active", fallbackActive),
+	)
 	h := s.Hertz(addr)
 	h.SetCustomSignalWaiter(func(errCh chan error) error {
 		select {
@@ -139,8 +176,22 @@ func NewServer(deps Dependencies) *Server {
 	if dataDir == "" && cfg.DataDir != "" {
 		dataDir = cfg.DataDir
 	}
+	logger := deps.Logger
+	if logger == nil {
+		logger = observability.NewLogger("codeflow-web")
+	}
 	skillManifest, _ := skills.Load(cfg.Skills)
 	mcpManifest, _ := mcp.Load(cfg.MCP)
+	var approvalStore storage.ApprovalStore
+	var eventStore storage.TaskEventStore
+	if deps.Store != nil {
+		if candidate, ok := deps.Store.(storage.ApprovalStore); ok {
+			approvalStore = candidate
+		}
+		if candidate, ok := deps.Store.(storage.TaskEventStore); ok {
+			eventStore = candidate
+		}
+	}
 	return &Server{
 		root:    projectRoot(deps.ProjectRoot),
 		cfg:     cfg,
@@ -153,6 +204,13 @@ func NewServer(deps Dependencies) *Server {
 		skills:  skillManifest,
 		mcp:     mcpManifest,
 		docs:    documents.NewStore(cfg.Documents),
+		logger:  logger,
+
+		approvals:      approval.NewService(approvalStore),
+		taskEvents:     eventStore,
+		storageBackend: strings.TrimSpace(deps.StorageBackend),
+		memoryBackend:  strings.TrimSpace(deps.MemoryBackend),
+		fallbackActive: deps.FallbackActive,
 	}
 }
 
@@ -170,13 +228,37 @@ func (s *Server) Routes(h *server.Hertz) {
 	h.Use(func(ctx context.Context, c *app.RequestContext) {
 		c.Response.Header.Set("Access-Control-Allow-Origin", "http://localhost:3000")
 		c.Response.Header.Set("Access-Control-Allow-Credentials", "true")
-		c.Response.Header.Set("Access-Control-Allow-Headers", "content-type")
+		c.Response.Header.Set("Access-Control-Allow-Headers", "content-type,x-request-id")
 		c.Response.Header.Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
 		if string(c.Method()) == consts.MethodOptions {
 			c.AbortWithStatus(consts.StatusNoContent)
 			return
 		}
 		c.Next(ctx)
+	})
+	h.Use(observability.RequestContextMiddleware(s.logger))
+	h.Use(func(ctx context.Context, c *app.RequestContext) {
+		start := time.Now()
+		c.Next(ctx)
+		if s.taskEvents == nil {
+			return
+		}
+		level := "info"
+		if c.Response.StatusCode() >= consts.StatusBadRequest {
+			level = "error"
+		}
+		s.emitTaskEvent(storage.CreateTaskEventInput{
+			RequestID: observability.RequestIDFromHertz(c),
+			Source:    "http",
+			Level:     level,
+			EventType: "http.request.completed",
+			Message:   fmt.Sprintf("%s %s", string(c.Method()), c.FullPath()),
+			Payload: fmt.Sprintf(`{"path":%q,"status":%d,"latency_ms":%d}`,
+				string(c.Path()),
+				c.Response.StatusCode(),
+				time.Since(start).Milliseconds(),
+			),
+		})
 	})
 	h.OPTIONS("/*path", func(ctx context.Context, c *app.RequestContext) {
 		c.AbortWithStatus(consts.StatusNoContent)
@@ -189,6 +271,11 @@ func (s *Server) Routes(h *server.Hertz) {
 	h.POST("/api/sessions", s.handleCreateSession)
 	h.POST("/api/sessions/:id/switch", s.handleSwitchSession)
 	h.DELETE("/api/sessions/:id", s.handleDeleteSession)
+	h.GET("/api/approvals", s.handleApprovals)
+	h.GET("/api/approvals/:id", s.handleApprovalByID)
+	h.POST("/api/approvals/:id/approve", s.handleApproveApproval)
+	h.POST("/api/approvals/:id/reject", s.handleRejectApproval)
+	h.GET("/api/task-events", s.handleTaskEvents)
 	h.GET("/api/audit/recent", s.handleRecentAudit)
 	h.POST("/api/documents/upload", s.handleDocumentUpload)
 	h.GET("/api/ws", s.handleWS)
@@ -213,6 +300,9 @@ func (s *Server) handleHealth(ctx context.Context, c *app.RequestContext) {
 		"postgres_configured": strings.TrimSpace(s.cfg.Storage.PostgresDSN) != "",
 		"redis_configured":    strings.TrimSpace(s.cfg.Storage.RedisAddr) != "",
 		"model_configured":    strings.TrimSpace(s.cfg.Model) != "",
+		"storage_backend":     defaultBackend(s.storageBackend, storage.BackendPostgres),
+		"memory_backend":      defaultBackend(s.memoryBackend, cfmemory.BackendRedis),
+		"fallback_active":     s.fallbackActive,
 	})
 }
 
@@ -228,7 +318,13 @@ func (s *Server) handleConfig(ctx context.Context, c *app.RequestContext) {
 			"redis_addr":          s.cfg.Storage.RedisAddr,
 			"redis_db":            s.cfg.Storage.RedisDB,
 		},
-		"runtime":   s.cfg.Runtime,
+		"runtime": s.cfg.Runtime,
+		"permissions": map[string]any{
+			"trusted_commands": s.cfg.Permissions.TrustedCommands,
+			"trusted_dirs":     s.cfg.Permissions.TrustedDirs,
+			"writable_dirs":    s.cfg.Permissions.WritableDirs,
+			"force_approval":   s.cfg.Permissions.ForceApproval,
+		},
 		"agent":     s.cfg.Agent,
 		"skills":    s.cfg.Skills,
 		"mcp":       s.cfg.MCP,
@@ -317,10 +413,20 @@ func (s *Server) handleDeleteSession(ctx context.Context, c *app.RequestContext)
 }
 
 func (s *Server) handleRecentAudit(ctx context.Context, c *app.RequestContext) {
-	limit := 20
-	if value := strings.TrimSpace(c.Query("limit")); value != "" {
-		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 && parsed <= 200 {
-			limit = parsed
+	limit := parseLimit(c.Query("limit"), 20, 200)
+	if s.taskEvents != nil {
+		events, err := s.taskEvents.ListTaskEvents(storage.ListTaskEventsOptions{
+			SessionID: strings.TrimSpace(c.Query("session_id")),
+			Limit:     limit,
+		})
+		if err == nil {
+			out := make([]audit.Event, 0, len(events))
+			for _, event := range events {
+				converted := taskEventToAudit(event)
+				out = append(out, converted)
+			}
+			writeJSON(c, consts.StatusOK, map[string]any{"events": out})
+			return
 		}
 	}
 	events, err := readRecentAudit(s.dataDir, limit)
@@ -329,6 +435,106 @@ func (s *Server) handleRecentAudit(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	writeJSON(c, consts.StatusOK, map[string]any{"events": events})
+}
+
+func (s *Server) handleApprovals(ctx context.Context, c *app.RequestContext) {
+	if s.approvals == nil || !s.approvals.Enabled() {
+		writeError(c, consts.StatusServiceUnavailable, "approval service unavailable")
+		return
+	}
+	status := strings.TrimSpace(c.Query("status"))
+	limit := parseLimit(c.Query("limit"), 100, 500)
+	items, err := s.approvals.List(status, limit)
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"approvals": items})
+}
+
+func (s *Server) handleApprovalByID(ctx context.Context, c *app.RequestContext) {
+	if s.approvals == nil || !s.approvals.Enabled() {
+		writeError(c, consts.StatusServiceUnavailable, "approval service unavailable")
+		return
+	}
+	record, err := s.approvals.Get(c.Param("id"))
+	if err != nil {
+		if errors.Is(err, approval.ErrApprovalNotFound) {
+			writeError(c, consts.StatusNotFound, err.Error())
+			return
+		}
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"approval": record})
+}
+
+func (s *Server) handleApproveApproval(ctx context.Context, c *app.RequestContext) {
+	s.decideApproval(ctx, c, true)
+}
+
+func (s *Server) handleRejectApproval(ctx context.Context, c *app.RequestContext) {
+	s.decideApproval(ctx, c, false)
+}
+
+func (s *Server) decideApproval(ctx context.Context, c *app.RequestContext, allowed bool) {
+	if s.approvals == nil || !s.approvals.Enabled() {
+		writeError(c, consts.StatusServiceUnavailable, "approval service unavailable")
+		return
+	}
+	reason := ""
+	if !allowed {
+		var req struct {
+			Reason string `json:"reason"`
+		}
+		if err := c.BindJSON(&req); err != nil {
+			writeError(c, consts.StatusBadRequest, "reason is required")
+			return
+		}
+		reason = strings.TrimSpace(req.Reason)
+	}
+	record, err := s.approvals.Decide(c.Param("id"), allowed, reason)
+	if err != nil {
+		switch {
+		case errors.Is(err, approval.ErrApprovalNotFound):
+			writeError(c, consts.StatusNotFound, err.Error())
+		case errors.Is(err, approval.ErrRejectReasonRequired):
+			writeError(c, consts.StatusBadRequest, err.Error())
+		case errors.Is(err, approval.ErrApprovalAlreadyDecided):
+			writeError(c, consts.StatusConflict, err.Error())
+		default:
+			writeError(c, consts.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	s.emitTaskEvent(storage.CreateTaskEventInput{
+		SessionID:   record.SessionID,
+		RequestID:   observability.RequestIDFromHertz(c),
+		OperationID: record.OperationID,
+		ApprovalID:  record.ID,
+		Source:      "api",
+		Level:       "info",
+		EventType:   "approval.decided",
+		Message:     "approval decision recorded via rest",
+		Payload:     fmt.Sprintf(`{"status":%q,"reason":%q}`, record.Status, record.DecisionReason),
+	})
+	writeJSON(c, consts.StatusOK, map[string]any{"approval": record})
+}
+
+func (s *Server) handleTaskEvents(ctx context.Context, c *app.RequestContext) {
+	if s.taskEvents == nil {
+		writeError(c, consts.StatusServiceUnavailable, "task event store unavailable")
+		return
+	}
+	items, err := s.taskEvents.ListTaskEvents(storage.ListTaskEventsOptions{
+		SessionID: strings.TrimSpace(c.Query("session_id")),
+		Limit:     parseLimit(c.Query("limit"), 200, 1000),
+	})
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"events": items})
 }
 
 func (s *Server) handleDocumentUpload(ctx context.Context, c *app.RequestContext) {
@@ -358,9 +564,14 @@ func (s *Server) newWebExecutor(confirmer permission.Confirmer) *cftools.Executo
 		TrustedCommands: s.cfg.Permissions.TrustedCommands,
 		TrustedDirs:     s.cfg.Permissions.TrustedDirs,
 		WritableDirs:    s.cfg.Permissions.WritableDirs,
+		ForceApproval:   s.cfg.Permissions.ForceApproval,
 		Confirmer:       confirmer,
 	})
-	return cftools.NewExecutor(gate, s.auditor)
+	var approvalStore storage.ApprovalStore
+	if s.approvals != nil {
+		approvalStore = s.approvals.Store()
+	}
+	return cftools.NewExecutor(gate, s.auditor, approvalStore, s.taskEvents)
 }
 
 func (s *Server) runtimeContext() string {
@@ -443,6 +654,61 @@ func writeJSON(c *app.RequestContext, status int, payload any) {
 
 func writeError(c *app.RequestContext, status int, message string) {
 	writeJSON(c, status, map[string]string{"error": message})
+}
+
+func (s *Server) emitTaskEvent(input storage.CreateTaskEventInput) {
+	if s.taskEvents == nil {
+		return
+	}
+	_, _ = s.taskEvents.CreateTaskEvent(input)
+}
+
+func parseLimit(raw string, fallback, max int) int {
+	limit := fallback
+	if value := strings.TrimSpace(raw); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 && parsed <= max {
+			limit = parsed
+		}
+	}
+	return limit
+}
+
+func taskEventToAudit(event storage.TaskEvent) audit.Event {
+	confirmed := true
+	switch event.EventType {
+	case "approval.failed", "execution.failed":
+		confirmed = false
+	}
+	if strings.Contains(strings.ToLower(event.Payload), `"allowed":false`) {
+		confirmed = false
+	}
+	return audit.Event{
+		Time:          event.CreatedAt.Format(time.RFC3339),
+		SessionID:     event.SessionID,
+		ProjectRoot:   "",
+		OperationID:   event.OperationID,
+		Event:         event.EventType,
+		ToolName:      event.Source,
+		ArgsSummary:   event.Message,
+		ResultSummary: truncateForAudit(event.Payload),
+		Confirmed:     &confirmed,
+	}
+}
+
+func truncateForAudit(payload string) string {
+	payload = strings.TrimSpace(payload)
+	if len(payload) <= 200 {
+		return payload
+	}
+	return payload[:200] + "..."
+}
+
+func defaultBackend(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func projectRoot(root string) string {

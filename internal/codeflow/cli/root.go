@@ -12,18 +12,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
-	"github.com/cloudwego/codeflow/internal/codeflow/audit"
-	cfconfig "github.com/cloudwego/codeflow/internal/codeflow/config"
-	"github.com/cloudwego/codeflow/internal/codeflow/engine"
-	cfmemory "github.com/cloudwego/codeflow/internal/codeflow/memory"
-	"github.com/cloudwego/codeflow/internal/codeflow/permission"
-	cfsession "github.com/cloudwego/codeflow/internal/codeflow/session"
-	"github.com/cloudwego/codeflow/internal/codeflow/storage"
-	cftools "github.com/cloudwego/codeflow/internal/codeflow/tools"
-	"github.com/cloudwego/codeflow/internal/codeflow/version"
-	"github.com/cloudwego/codeflow/internal/codeflow/web"
+	"github.com/viko0313/CodeFlow/internal/codeflow/audit"
+	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
+	"github.com/viko0313/CodeFlow/internal/codeflow/engine"
+	cfmemory "github.com/viko0313/CodeFlow/internal/codeflow/memory"
+	"github.com/viko0313/CodeFlow/internal/codeflow/observability"
+	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
+	cfsession "github.com/viko0313/CodeFlow/internal/codeflow/session"
+	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
+	cftools "github.com/viko0313/CodeFlow/internal/codeflow/tools"
+	"github.com/viko0313/CodeFlow/internal/codeflow/version"
+	"github.com/viko0313/CodeFlow/internal/codeflow/web"
 )
 
 type appOptions struct {
@@ -192,16 +194,25 @@ func runStart(ctx context.Context, opts *appOptions) error {
 	if err != nil {
 		return err
 	}
-	store, err := storage.NewPostgresSessionStore(ctx, cfg.Storage.PostgresDSN)
+	logger := observability.NewLogger("codeflow-cli")
+	store, storageBackend, storageFallback, err := storage.OpenSessionStoreWithFallback(ctx, cfg.Storage.PostgresDSN, cfg.DataDir)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	shortMemory, err := cfmemory.NewRedisShortTermMemory(ctx, cfg.Storage.RedisAddr, cfg.Storage.RedisPass, cfg.Storage.RedisDB)
+	shortMemory, memoryBackend, memoryFallback, err := cfmemory.OpenShortTermMemoryWithFallback(ctx, cfg.Storage.RedisAddr, cfg.Storage.RedisPass, cfg.Storage.RedisDB)
 	if err != nil {
 		return err
 	}
 	defer shortMemory.Close()
+	if storageFallback || memoryFallback {
+		logger.WarnContext(ctx, "runtime fallback activated",
+			"component", "runtime",
+			"event", "runtime.fallback",
+			"storage_backend", storageBackend,
+			"memory_backend", memoryBackend,
+		)
+	}
 	agentMD := readAgentMD(root)
 	session, err := store.GetActive(root)
 	if err != nil {
@@ -221,8 +232,17 @@ func runStart(ctx context.Context, opts *appOptions) error {
 		TrustedCommands: cfg.Permissions.TrustedCommands,
 		TrustedDirs:     cfg.Permissions.TrustedDirs,
 		WritableDirs:    cfg.Permissions.WritableDirs,
+		ForceApproval:   cfg.Permissions.ForceApproval,
 	})
-	executor := cftools.NewExecutor(gate, auditor)
+	var approvalStore storage.ApprovalStore
+	var eventStore storage.TaskEventStore
+	if candidate, ok := store.(storage.ApprovalStore); ok {
+		approvalStore = candidate
+	}
+	if candidate, ok := store.(storage.TaskEventStore); ok {
+		eventStore = candidate
+	}
+	executor := cftools.NewExecutor(gate, auditor, approvalStore, eventStore)
 	llm, err := engine.New(ctx, cfg, shortMemory)
 	if err != nil {
 		return err
@@ -230,6 +250,8 @@ func runStart(ctx context.Context, opts *appOptions) error {
 	fmt.Printf("%s %s\n", version.ProductName, version.Version)
 	fmt.Printf("Project: %s\n", root)
 	fmt.Printf("Session: %s\n", session.ID)
+	fmt.Printf("Storage backend: %s\n", storageBackend)
+	fmt.Printf("Memory backend: %s\n", memoryBackend)
 	if agentMD != "" {
 		fmt.Println("Loaded AGENT.md project rules.")
 	}
@@ -298,7 +320,13 @@ func handleInput(ctx context.Context, input string, llm engine.Engine, memory cf
 		return handleSessionSlash(store, session, root, fields)
 	case "/run":
 		command := strings.TrimSpace(strings.TrimPrefix(input, "/run"))
-		result, err := executor.Execute(ctx, cftools.Operation{Kind: permission.OperationShell, ProjectRoot: root, Command: command, Timeout: 60 * time.Second}, session.ID)
+		result, err := executor.Execute(ctx, cftools.Operation{
+			Kind:        permission.OperationShell,
+			ProjectRoot: root,
+			Command:     command,
+			Timeout:     60 * time.Second,
+			RequestID:   nextRequestID(),
+		}, session.ID)
 		if result.Output != "" {
 			fmt.Println(result.Output)
 		}
@@ -319,7 +347,13 @@ func handleInput(ctx context.Context, input string, llm engine.Engine, memory cf
 			}
 			b.WriteString(line)
 		}
-		result, err := executor.Execute(ctx, cftools.Operation{Kind: permission.OperationWriteFile, ProjectRoot: root, Path: fields[1], Content: b.String()}, session.ID)
+		result, err := executor.Execute(ctx, cftools.Operation{
+			Kind:        permission.OperationWriteFile,
+			ProjectRoot: root,
+			Path:        fields[1],
+			Content:     b.String(),
+			RequestID:   nextRequestID(),
+		}, session.ID)
 		if result.Output != "" {
 			fmt.Println(result.Output)
 		}
@@ -390,7 +424,7 @@ func handleSessionSlash(store cfsession.Store, active *cfsession.Session, root s
 func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  /help [command]              Show help")
-	fmt.Println("  /clear                       Clear Redis short-term memory")
+	fmt.Println("  /clear                       Clear short-term memory")
 	fmt.Println("  /version                     Show version")
 	fmt.Println("  /session list                List project sessions")
 	fmt.Println("  /session switch <session-id> Switch active session")
@@ -401,15 +435,20 @@ func printHelp() {
 }
 
 func openSessionStore(ctx context.Context, rootFlag string) (cfsession.Store, func(), error) {
-	cfg, err := cfconfig.Load(projectRoot(rootFlag))
+	root := projectRoot(rootFlag)
+	cfg, err := cfconfig.Load(root)
 	if err != nil {
 		return nil, nil, err
 	}
-	store, err := storage.NewPostgresSessionStore(ctx, cfg.Storage.PostgresDSN)
+	store, _, _, err := storage.OpenSessionStoreWithFallback(ctx, cfg.Storage.PostgresDSN, cfg.DataDir)
 	if err != nil {
 		return nil, nil, err
 	}
 	return store, store.Close, nil
+}
+
+func nextRequestID() string {
+	return "cli_" + uuid.NewString()[:8]
 }
 
 func projectRoot(flag string) string {

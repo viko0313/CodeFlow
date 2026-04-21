@@ -42,6 +42,7 @@ type PermissionConfig struct {
 	TrustedCommands []string `mapstructure:"trusted_commands" yaml:"trusted_commands"`
 	TrustedDirs     []string `mapstructure:"trusted_dirs" yaml:"trusted_dirs"`
 	WritableDirs    []string `mapstructure:"writable_dirs" yaml:"writable_dirs"`
+	ForceApproval   bool     `mapstructure:"force_approval" yaml:"force_approval"`
 }
 
 type RuntimeConfig struct {
@@ -100,6 +101,12 @@ func Default(projectRoot string) Config {
 		Runtime: RuntimeConfig{
 			MaxTurns:   50,
 			MaxActions: 20,
+		},
+		Permissions: PermissionConfig{
+			TrustedCommands: []string{},
+			TrustedDirs:     []string{},
+			WritableDirs:    []string{},
+			ForceApproval:   true,
 		},
 		Agent: AgentConfig{
 			Mode:        "react",
@@ -202,6 +209,7 @@ func EnsureProjectConfig(projectRoot string) error {
 		"  trusted_commands: []",
 		"  trusted_dirs: []",
 		"  writable_dirs: []",
+		"  force_approval: true",
 		"runtime:",
 		"  max_turns: 50",
 		"  max_actions: 20",
@@ -252,6 +260,8 @@ func Get(projectRoot, key string) (string, error) {
 		return cfg.Agent.Mode, nil
 	case "agent.plan_enabled":
 		return strconv.FormatBool(cfg.Agent.PlanEnabled), nil
+	case "permissions.force_approval":
+		return strconv.FormatBool(cfg.Permissions.ForceApproval), nil
 	default:
 		return "", fmt.Errorf("unknown config key %q", key)
 	}

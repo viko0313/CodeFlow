@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	cfconfig "github.com/cloudwego/codeflow/internal/codeflow/config"
+	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
 )
 
 func TestLoadMCPServersFromClaudeStyleJSON(t *testing.T) {

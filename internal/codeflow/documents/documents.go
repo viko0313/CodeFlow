@@ -15,7 +15,7 @@ import (
 	fileloader "github.com/cloudwego/eino-ext/components/document/loader/file"
 	einodoc "github.com/cloudwego/eino/components/document"
 
-	cfconfig "github.com/cloudwego/codeflow/internal/codeflow/config"
+	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
 )
 
 type UploadedDocument struct {
