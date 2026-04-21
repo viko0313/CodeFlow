@@ -13,3 +13,4 @@ web/node_modules/
 web/.env.local
 web/coverage/
 web/tsconfig.tsbuildinfo
+docs/ai-review/
