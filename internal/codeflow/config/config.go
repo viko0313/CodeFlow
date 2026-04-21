@@ -24,6 +24,10 @@ type Config struct {
 	Storage     StorageConfig     `mapstructure:"storage" yaml:"storage"`
 	Permissions PermissionConfig  `mapstructure:"permissions" yaml:"permissions"`
 	Runtime     RuntimeConfig     `mapstructure:"runtime" yaml:"runtime"`
+	Agent       AgentConfig       `mapstructure:"agent" yaml:"agent"`
+	Skills      SkillsConfig      `mapstructure:"skills" yaml:"skills"`
+	MCP         MCPConfig         `mapstructure:"mcp" yaml:"mcp"`
+	Documents   DocumentsConfig   `mapstructure:"documents" yaml:"documents"`
 	Reserved    map[string]string `mapstructure:"reserved" yaml:"reserved,omitempty"`
 }
 
@@ -45,6 +49,39 @@ type RuntimeConfig struct {
 	MaxActions int `mapstructure:"max_actions" yaml:"max_actions"`
 }
 
+type AgentConfig struct {
+	Mode        string `mapstructure:"mode" yaml:"mode"`
+	PlanEnabled bool   `mapstructure:"plan_enabled" yaml:"plan_enabled"`
+}
+
+type SkillsConfig struct {
+	Enabled         bool     `mapstructure:"enabled" yaml:"enabled"`
+	Dirs            []string `mapstructure:"dirs" yaml:"dirs"`
+	Preload         []string `mapstructure:"preload" yaml:"preload"`
+	MaxContentBytes int      `mapstructure:"max_content_bytes" yaml:"max_content_bytes"`
+}
+
+type MCPConfig struct {
+	Enabled     bool        `mapstructure:"enabled" yaml:"enabled"`
+	Preload     bool        `mapstructure:"preload" yaml:"preload"`
+	ConfigFiles []string    `mapstructure:"config_files" yaml:"config_files"`
+	Servers     []MCPServer `mapstructure:"servers" yaml:"servers"`
+}
+
+type MCPServer struct {
+	Name    string            `mapstructure:"name" yaml:"name" json:"name"`
+	Command string            `mapstructure:"command" yaml:"command" json:"command"`
+	Args    []string          `mapstructure:"args" yaml:"args" json:"args"`
+	Env     map[string]string `mapstructure:"env" yaml:"env" json:"env,omitempty"`
+	Enabled bool              `mapstructure:"enabled" yaml:"enabled" json:"enabled"`
+}
+
+type DocumentsConfig struct {
+	UploadDir         string   `mapstructure:"upload_dir" yaml:"upload_dir"`
+	MaxUploadBytes    int64    `mapstructure:"max_upload_bytes" yaml:"max_upload_bytes"`
+	AllowedExtensions []string `mapstructure:"allowed_extensions" yaml:"allowed_extensions"`
+}
+
 func Default(projectRoot string) Config {
 	root := absOr(projectRoot, mustGetwd())
 	return Config{
@@ -64,13 +101,33 @@ func Default(projectRoot string) Config {
 			MaxTurns:   50,
 			MaxActions: 20,
 		},
+		Agent: AgentConfig{
+			Mode:        "react",
+			PlanEnabled: false,
+		},
+		Skills: SkillsConfig{
+			Enabled:         true,
+			Dirs:            []string{filepath.Join(root, ".codeflow", "skills")},
+			Preload:         []string{},
+			MaxContentBytes: 6000,
+		},
+		MCP: MCPConfig{
+			Enabled:     true,
+			Preload:     true,
+			ConfigFiles: []string{filepath.Join(root, ".codeflow", "mcp.json"), filepath.Join(root, ".codeflow", "mcp.yaml")},
+			Servers:     []MCPServer{},
+		},
+		Documents: DocumentsConfig{
+			UploadDir:         filepath.Join(root, ".codeflow", "uploads"),
+			MaxUploadBytes:    10 * 1024 * 1024,
+			AllowedExtensions: []string{".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".csv", ".html", ".pdf"},
+		},
 		Reserved: map[string]string{
-			"mcp":        "phase2",
 			"milvus":     "phase2",
 			"subagent":   "phase3",
 			"checkpoint": "phase3",
 			"evolution":  "phase4",
-			"web":        "phase5",
+			"web":        "available",
 		},
 	}
 }
@@ -102,6 +159,22 @@ func Load(projectRoot string) (*Config, error) {
 	if cfg.Runtime.MaxActions <= 0 {
 		cfg.Runtime.MaxActions = 20
 	}
+	cfg.Agent.Mode = strings.ToLower(strings.TrimSpace(cfg.Agent.Mode))
+	if cfg.Agent.Mode == "" {
+		cfg.Agent.Mode = "react"
+	}
+	if cfg.Skills.MaxContentBytes <= 0 {
+		cfg.Skills.MaxContentBytes = 6000
+	}
+	cfg.Skills.Dirs = absList(root, cfg.Skills.Dirs)
+	cfg.MCP.ConfigFiles = absList(root, cfg.MCP.ConfigFiles)
+	cfg.Documents.UploadDir = absOr(cfg.Documents.UploadDir, filepath.Join(root, ".codeflow", "uploads"))
+	if cfg.Documents.MaxUploadBytes <= 0 {
+		cfg.Documents.MaxUploadBytes = 10 * 1024 * 1024
+	}
+	if len(cfg.Documents.AllowedExtensions) == 0 {
+		cfg.Documents.AllowedExtensions = []string{".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".csv", ".html", ".pdf"}
+	}
 	return &cfg, nil
 }
 
@@ -132,6 +205,26 @@ func EnsureProjectConfig(projectRoot string) error {
 		"runtime:",
 		"  max_turns: 50",
 		"  max_actions: 20",
+		"agent:",
+		"  mode: \"react\"",
+		"  plan_enabled: false",
+		"skills:",
+		"  enabled: true",
+		"  dirs:",
+		"    - \".codeflow/skills\"",
+		"  preload: []",
+		"  max_content_bytes: 6000",
+		"mcp:",
+		"  enabled: true",
+		"  preload: true",
+		"  config_files:",
+		"    - \".codeflow/mcp.json\"",
+		"    - \".codeflow/mcp.yaml\"",
+		"  servers: []",
+		"documents:",
+		"  upload_dir: \".codeflow/uploads\"",
+		"  max_upload_bytes: 10485760",
+		"  allowed_extensions: [\".txt\", \".md\", \".markdown\", \".json\", \".yaml\", \".yml\", \".csv\", \".html\", \".pdf\"]",
 		"",
 	}, "\n")
 	return os.WriteFile(path, []byte(content), 0600)
@@ -155,6 +248,10 @@ func Get(projectRoot, key string) (string, error) {
 		return cfg.Storage.RedisAddr, nil
 	case "storage.redis_db":
 		return strconv.Itoa(cfg.Storage.RedisDB), nil
+	case "agent.mode":
+		return cfg.Agent.Mode, nil
+	case "agent.plan_enabled":
+		return strconv.FormatBool(cfg.Agent.PlanEnabled), nil
 	default:
 		return "", fmt.Errorf("unknown config key %q", key)
 	}
@@ -237,6 +334,22 @@ func (c *Config) expandEnv() {
 	c.Storage.PostgresDSN = expandOrEmpty(c.Storage.PostgresDSN)
 	c.Storage.RedisAddr = os.ExpandEnv(c.Storage.RedisAddr)
 	c.Storage.RedisPass = expandOrEmpty(c.Storage.RedisPass)
+	c.Documents.UploadDir = os.ExpandEnv(c.Documents.UploadDir)
+	for i := range c.Skills.Dirs {
+		c.Skills.Dirs[i] = os.ExpandEnv(c.Skills.Dirs[i])
+	}
+	for i := range c.MCP.ConfigFiles {
+		c.MCP.ConfigFiles[i] = os.ExpandEnv(c.MCP.ConfigFiles[i])
+	}
+	for i := range c.MCP.Servers {
+		c.MCP.Servers[i].Command = os.ExpandEnv(c.MCP.Servers[i].Command)
+		for j := range c.MCP.Servers[i].Args {
+			c.MCP.Servers[i].Args[j] = os.ExpandEnv(c.MCP.Servers[i].Args[j])
+		}
+		for key, value := range c.MCP.Servers[i].Env {
+			c.MCP.Servers[i].Env[key] = os.ExpandEnv(value)
+		}
+	}
 }
 
 func (c *Config) applyProviderDefaults() {
@@ -309,6 +422,25 @@ func absOr(path, fallback string) string {
 		return abs
 	}
 	return path
+}
+
+func absList(root string, values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if !filepath.IsAbs(value) && !hasWindowsDrive(value) {
+			value = filepath.Join(root, value)
+		}
+		out = append(out, absOr(value, root))
+	}
+	return out
+}
+
+func hasWindowsDrive(path string) bool {
+	return len(path) >= 2 && ((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z')) && path[1] == ':'
 }
 
 func mustGetwd() string {

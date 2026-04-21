@@ -34,6 +34,8 @@ type Request struct {
 	ProjectRoot string
 	Input       string
 	AgentMD     string
+	Context     string
+	PlanEnabled bool
 }
 
 type Engine interface {
@@ -86,8 +88,17 @@ func (e *LLMEngine) Run(ctx context.Context, req Request) (<-chan Event, error) 
 
 func (e *LLMEngine) messages(ctx context.Context, req Request) []*schema.Message {
 	system := "You are CodeFlow Agent, a terminal-native enterprise coding assistant. Prefer concise, auditable steps. Do not modify files or run commands directly; ask the host tool executor to handle privileged operations."
+	system += "\n\n[Agent runtime]\nmode=" + e.cfg.Agent.Mode
+	if req.PlanEnabled || e.cfg.Agent.PlanEnabled {
+		system += "\nplan=true: respond with a concise implementation plan before execution-oriented guidance."
+	} else {
+		system += "\nplan=false: answer directly unless the user asks for planning."
+	}
 	if strings.TrimSpace(req.AgentMD) != "" {
 		system += "\n\n[Project rules from AGENT.md]\n" + strings.TrimSpace(req.AgentMD)
+	}
+	if strings.TrimSpace(req.Context) != "" {
+		system += "\n\n[Preloaded CodeFlow context]\n" + strings.TrimSpace(req.Context)
 	}
 	if turns, err := e.memory.GetRecent(ctx, req.SessionID, 20); err == nil && len(turns) > 0 {
 		var b strings.Builder

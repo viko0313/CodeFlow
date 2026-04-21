@@ -23,11 +23,13 @@ import (
 	"github.com/cloudwego/codeflow/internal/codeflow/storage"
 	cftools "github.com/cloudwego/codeflow/internal/codeflow/tools"
 	"github.com/cloudwego/codeflow/internal/codeflow/version"
+	"github.com/cloudwego/codeflow/internal/codeflow/web"
 )
 
 type appOptions struct {
 	projectRoot string
 	once        string
+	webAddr     string
 }
 
 func Execute(args []string) error {
@@ -39,7 +41,7 @@ func Execute(args []string) error {
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().StringVar(&opts.projectRoot, "project-root", "", "Project root; defaults to the current directory")
-	root.AddCommand(startCommand(opts), sessionCommand(opts), configCommand(opts), versionCommand())
+	root.AddCommand(startCommand(opts), webCommand(opts), sessionCommand(opts), configCommand(opts), versionCommand())
 	root.SetArgs(args)
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
@@ -58,6 +60,18 @@ func startCommand(opts *appOptions) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&opts.once, "once", "", "Run one prompt and exit; useful for smoke tests")
 	_ = cmd.Flags().MarkHidden("once")
+	return cmd
+}
+
+func webCommand(opts *appOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "web",
+		Short: "Start the CodeFlow local Web API and WebSocket server",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return web.Run(cmd.Context(), web.Options{Addr: opts.webAddr, ProjectRoot: opts.projectRoot})
+		},
+	}
+	cmd.Flags().StringVar(&opts.webAddr, "addr", "localhost:8742", "HTTP listen address for the local Web API")
 	return cmd
 }
 

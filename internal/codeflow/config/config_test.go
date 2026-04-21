@@ -26,6 +26,15 @@ func TestEnsureAndLoadProjectConfig(t *testing.T) {
 	if cfg.Storage.PostgresDSN == "" {
 		t.Fatal("expected postgres dsn from env")
 	}
+	if cfg.Agent.Mode != "react" {
+		t.Fatalf("expected react agent mode, got %q", cfg.Agent.Mode)
+	}
+	if len(cfg.Skills.Dirs) != 1 || !filepath.IsAbs(cfg.Skills.Dirs[0]) {
+		t.Fatalf("expected absolute skills dir, got %+v", cfg.Skills.Dirs)
+	}
+	if cfg.Documents.UploadDir == "" || !filepath.IsAbs(cfg.Documents.UploadDir) {
+		t.Fatalf("expected absolute document upload dir, got %q", cfg.Documents.UploadDir)
+	}
 }
 
 func TestRejectPlaintextSecretInProjectConfig(t *testing.T) {
@@ -56,5 +65,29 @@ func TestConfigSetRequiresSecretEnvReference(t *testing.T) {
 	}
 	if value != "ollama" {
 		t.Fatalf("expected provider ollama, got %q", value)
+	}
+}
+
+func TestAgentConfigGetSet(t *testing.T) {
+	dir := t.TempDir()
+	if err := Set(dir, "agent.mode", "react"); err != nil {
+		t.Fatal(err)
+	}
+	value, err := Get(dir, "agent.mode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "react" {
+		t.Fatalf("expected react mode, got %q", value)
+	}
+	if err := Set(dir, "agent.plan_enabled", "true"); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Get(dir, "agent.plan_enabled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan != "true" {
+		t.Fatalf("expected plan enabled, got %q", plan)
 	}
 }
