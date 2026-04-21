@@ -18,8 +18,9 @@ Phase 1 MVP is intentionally focused:
 - Shell command preview, working directory, timeout, and risk display before execution.
 - JSONL audit events under `.codeflow/logs`.
 - Single primary CLI entrypoint under `cmd/codeflow`.
+- Local Web workspace with Dashboard, IDE, WebSocket approvals, Monaco editor, and Xterm.js terminal.
 
-Not in Phase 1: Web GUI, Milvus vector memory, full MCP integration, Subagents, checkpoint rewind, and the self-evolution engine. The V2 packages reserve clean boundaries for those phases without pretending they are complete.
+Still deferred: Milvus vector memory, full MCP integration, Subagents, checkpoint rewind, and the self-evolution engine. The V2 packages reserve clean boundaries for those phases without pretending they are complete.
 
 ## Quick Start
 
@@ -80,6 +81,89 @@ Inside `codeflow start`:
 /edit <path>
 /diff
 /exit
+```
+
+## Web UI
+
+CodeFlow also ships a local Web workspace built with Next.js, Hertz, WebSocket,
+Monaco, Xterm.js, Auth.js, TanStack Query, Zustand, Shadcn-style components, and
+Recharts.
+
+Start the Go Web API and WebSocket server:
+
+```powershell
+go run .\cmd\codeflow web --addr localhost:8742
+```
+
+Start the frontend:
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+Open:
+
+```text
+http://localhost:3000
+```
+
+Local development login defaults to:
+
+```text
+CODEFLOW_WEB_USER=admin
+CODEFLOW_WEB_PASSWORD=codeflow
+```
+
+Set `AUTH_SECRET` for non-development runs. The frontend proxies
+`/api/codeflow/*` to `http://localhost:8742/api/*`; WebSocket traffic connects
+directly to `ws://localhost:8742/api/ws`.
+
+The Web IDE defaults to Eino ReAct mode. Use the `Plan` toggle in the IDE to ask
+the agent to produce a concise plan before execution-oriented guidance. Document
+upload is available from the IDE toolbar; files are stored under
+`.codeflow/uploads` and parsed through EinoExt's file document loader before the
+content is preloaded into the next chat request.
+
+Skill and MCP preloading are configured in `.codeflow/config.yaml`:
+
+```yaml
+agent:
+  mode: "react"
+  plan_enabled: false
+skills:
+  enabled: true
+  dirs:
+    - ".codeflow/skills"
+  preload: []
+  max_content_bytes: 6000
+mcp:
+  enabled: true
+  preload: true
+  config_files:
+    - ".codeflow/mcp.json"
+    - ".codeflow/mcp.yaml"
+  servers: []
+documents:
+  upload_dir: ".codeflow/uploads"
+  max_upload_bytes: 10485760
+  allowed_extensions: [".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".csv", ".html", ".pdf"]
+```
+
+`skills.preload` accepts skill names or `*`. MCP config files support the common
+`mcpServers` JSON shape, for example:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "node",
+      "args": ["server.js"],
+      "env": { "ROOT": "." }
+    }
+  }
+}
 ```
 
 ## Configuration
@@ -163,5 +247,5 @@ go test ./internal/codeflow/...
 - Phase 2: progressive Skill disclosure, MCP configuration, and layered memory expansion.
 - Phase 3: checkpoint rewind, Git/code-understanding tools, and Subagent orchestration.
 - Phase 4: self-evolution engine, feedback learning, code pattern learning, and performance tuning.
-- Phase 5: Next.js Web GUI, Monaco, Xterm.js, and real-time CLI/Web synchronization.
+- Phase 5: Harden Web GUI synchronization, multi-client collaboration, and deployment packaging.
 - Phase 6: hardening, cross-platform packaging, security testing, and official Skill library.
