@@ -1,12 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  appendUserMessage,
-  initialEventState,
-  reduceServerEvent,
-  type EventState,
-} from "@/lib/event-reducer";
+import { appendUserMessage, initialEventState, reduceServerEvent, type EventState } from "@/lib/event-reducer";
 import type { ClientMessage, ServerEvent } from "@/lib/types";
 import { useUiStore } from "@/stores/use-ui-store";
 
@@ -18,7 +13,21 @@ export function useCodeFlowSocket(sessionId?: string) {
   const setSocketStatus = useUiStore((store) => store.setSocketStatus);
   const setPendingApproval = useUiStore((store) => store.setPendingApproval);
   const setActiveSessionId = useUiStore((store) => store.setActiveSessionId);
+  const setEventState = useUiStore((store) => store.setEventState);
   const planEnabled = useUiStore((store) => store.planEnabled);
+
+  useEffect(() => {
+    if (!sessionId) {
+      setState(initialEventState);
+      return;
+    }
+    setState(useUiStore.getState().getIdeState(sessionId));
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    setEventState(sessionId, state);
+  }, [sessionId, setEventState, state]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -70,12 +79,17 @@ export function useCodeFlowSocket(sessionId?: string) {
     [planEnabled, send],
   );
 
+  const restoreState = useCallback((nextState: EventState) => {
+    setState(nextState);
+  }, []);
+
   return useMemo(
     () => ({
       state,
       send,
       sendChat,
+      restoreState,
     }),
-    [send, sendChat, state],
+    [restoreState, send, sendChat, state],
   );
 }

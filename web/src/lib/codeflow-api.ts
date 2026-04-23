@@ -5,6 +5,7 @@ import type {
   CodeFlowSession,
   Health,
   McpManifest,
+  SessionHistory,
   SkillManifest,
   TaskEvent,
   UploadedDocument,
@@ -51,6 +52,12 @@ export function switchSession(id: string) {
   return request<CodeFlowSession>(`/sessions/${id}/switch`, { method: "POST" });
 }
 
+export function getSessionHistory(id: string, params?: { limit?: number }) {
+  const query = new URLSearchParams();
+  if (params?.limit) query.set("limit", String(params.limit));
+  return request<SessionHistory>(`/sessions/${id}/history${query.size ? `?${query}` : ""}`);
+}
+
 export function deleteSession(id: string) {
   return request<{ deleted: string }>(`/sessions/${id}`, { method: "DELETE" });
 }
@@ -94,11 +101,17 @@ export async function getTaskEvents(params?: { sessionId?: string; limit?: numbe
 }
 
 export function getSkills() {
-  return request<SkillManifest>("/skills");
+  return request<SkillManifest>("/skills").then((payload) => ({
+    ...payload,
+    skills: payload.skills ?? [],
+  }));
 }
 
 export function getMcp() {
-  return request<McpManifest>("/mcp");
+  return request<McpManifest>("/mcp").then((payload) => ({
+    ...payload,
+    servers: payload.servers ?? [],
+  }));
 }
 
 export async function uploadDocument(file: File) {

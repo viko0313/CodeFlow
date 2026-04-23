@@ -26,7 +26,7 @@ export function DialogContent({
         {children}
         <DialogPrimitive.Close className="absolute right-3 top-3 rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--panel-strong)]">
           <X className="h-4 w-4" />
-          <span className="sr-only">Close</span>
+          <span className="sr-only">关闭</span>
         </DialogPrimitive.Close>
       </DialogPrimitive.Content>
     </DialogPrimitive.Portal>

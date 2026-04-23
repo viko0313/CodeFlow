@@ -269,6 +269,7 @@ func (s *Server) Routes(h *server.Hertz) {
 	h.GET("/api/mcp", s.handleMCP)
 	h.GET("/api/sessions", s.handleSessions)
 	h.POST("/api/sessions", s.handleCreateSession)
+	h.GET("/api/sessions/:id/history", s.handleSessionHistory)
 	h.POST("/api/sessions/:id/switch", s.handleSwitchSession)
 	h.DELETE("/api/sessions/:id", s.handleDeleteSession)
 	h.GET("/api/approvals", s.handleApprovals)
@@ -397,6 +398,30 @@ func (s *Server) handleSwitchSession(ctx context.Context, c *app.RequestContext)
 		return
 	}
 	writeJSON(c, consts.StatusOK, session)
+}
+
+func (s *Server) handleSessionHistory(ctx context.Context, c *app.RequestContext) {
+	sessionID := strings.TrimSpace(c.Param("id"))
+	if sessionID == "" {
+		writeError(c, consts.StatusBadRequest, "session id is required")
+		return
+	}
+	if s.memory == nil {
+		writeJSON(c, consts.StatusOK, map[string]any{
+			"session_id": sessionID,
+			"turns":      []cfmemory.Turn{},
+		})
+		return
+	}
+	turns, err := s.memory.GetRecent(ctx, sessionID, int64(parseLimit(c.Query("limit"), 20, 20)))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{
+		"session_id": sessionID,
+		"turns":      turns,
+	})
 }
 
 func (s *Server) handleDeleteSession(ctx context.Context, c *app.RequestContext) {

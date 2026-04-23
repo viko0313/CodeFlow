@@ -1,4 +1,4 @@
-import type { PendingApproval, ServerEvent } from "@/lib/types";
+import type { PendingApproval, ServerEvent, SessionHistoryTurn } from "@/lib/types";
 
 export type ChatMessage = {
   id: string;
@@ -21,6 +21,17 @@ export const initialEventState: EventState = {
   terminal: [],
   timeline: [],
 };
+
+export function initializeEventState(turns: SessionHistoryTurn[]): EventState {
+  return {
+    ...initialEventState,
+    chat: turns.map((turn, index) => ({
+      id: `history-${index}`,
+      role: turn.role,
+      content: turn.content,
+    })),
+  };
+}
 
 export function appendUserMessage(state: EventState, id: string, content: string): EventState {
   return {

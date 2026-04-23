@@ -18,6 +18,7 @@ import (
 
 	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
 	"github.com/viko0313/CodeFlow/internal/codeflow/engine"
+	cfmemory "github.com/viko0313/CodeFlow/internal/codeflow/memory"
 	cfsession "github.com/viko0313/CodeFlow/internal/codeflow/session"
 	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
 )
@@ -251,6 +252,45 @@ func TestDocumentUploadAPI(t *testing.T) {
 	}
 	if uploaded.FileName != "note.txt" || !strings.Contains(uploaded.Content, "hello uploaded document") {
 		t.Fatalf("unexpected upload response: %+v", uploaded)
+	}
+}
+
+func TestSessionHistoryAPI(t *testing.T) {
+	store := newFakeStore(t.TempDir())
+	mem := cfmemory.NewInMemoryShortTermMemory()
+	if err := mem.Append(context.Background(), "s1", cfmemory.Turn{Role: "user", Content: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.Append(context.Background(), "s1", cfmemory.Turn{Role: "assistant", Content: "hi there"}); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Dependencies{ProjectRoot: store.root, Config: testConfig(), Store: store, Memory: mem})
+	baseURL, cleanup := startHertzTestServer(t, server)
+	defer cleanup()
+
+	resp, err := http.Get(baseURL + "/api/sessions/s1/history?limit=20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history status = %d", resp.StatusCode)
+	}
+	var payload struct {
+		SessionID string          `json:"session_id"`
+		Turns     []cfmemory.Turn `json:"turns"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.SessionID != "s1" {
+		t.Fatalf("unexpected session id: %q", payload.SessionID)
+	}
+	if len(payload.Turns) != 2 {
+		t.Fatalf("expected 2 turns, got %d", len(payload.Turns))
+	}
+	if payload.Turns[0].Role != "user" || payload.Turns[1].Role != "assistant" {
+		t.Fatalf("unexpected turns: %+v", payload.Turns)
 	}
 }
 

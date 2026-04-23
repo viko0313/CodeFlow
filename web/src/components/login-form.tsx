@@ -25,7 +25,7 @@ export function LoginForm() {
     });
     setPending(false);
     if (result?.error) {
-      setError("The local credentials did not match.");
+      setError("本地账号或密码不正确。");
       return;
     }
     router.push(params.get("callbackUrl") ?? "/dashboard");
@@ -35,11 +35,11 @@ export function LoginForm() {
   return (
     <form className="space-y-4" onSubmit={submit}>
       <label className="block text-sm font-medium">
-        Username
+        用户名
         <Input className="mt-2" value={username} onChange={(event) => setUsername(event.target.value)} />
       </label>
       <label className="block text-sm font-medium">
-        Password
+        密码
         <Input
           className="mt-2"
           type="password"
@@ -49,7 +49,7 @@ export function LoginForm() {
       </label>
       {error ? <p className="text-sm text-[var(--danger)]">{error}</p> : null}
       <Button className="w-full" type="submit" disabled={pending}>
-        {pending ? "Signing in" : "Enter workspace"}
+        {pending ? "登录中" : "进入工作台"}
       </Button>
     </form>
   );

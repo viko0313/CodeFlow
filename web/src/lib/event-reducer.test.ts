@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initialEventState, reduceServerEvent } from "@/lib/event-reducer";
+import { initialEventState, initializeEventState, reduceServerEvent } from "@/lib/event-reducer";
 
 describe("reduceServerEvent", () => {
   it("accumulates streamed assistant tokens", () => {
@@ -44,5 +44,29 @@ describe("reduceServerEvent", () => {
       status: "approved",
     });
     expect(decided.pendingApproval).toBeUndefined();
+  });
+
+  it("hydrates recent history before realtime events", () => {
+    const hydrated = initializeEventState([
+      { role: "user", content: "Check README", created_at: "2026-04-22T00:00:00Z" },
+      { role: "assistant", content: "Sure.", created_at: "2026-04-22T00:00:01Z" },
+    ]);
+
+    expect(hydrated.chat).toEqual([
+      { id: "history-0", role: "user", content: "Check README" },
+      { id: "history-1", role: "assistant", content: "Sure." },
+    ]);
+
+    const next = reduceServerEvent(hydrated, {
+      type: "chat.token",
+      id: "live-1",
+      content: "New",
+    });
+
+    expect(next.chat).toEqual([
+      { id: "history-0", role: "user", content: "Check README" },
+      { id: "history-1", role: "assistant", content: "Sure." },
+      { id: "live-1", role: "assistant", content: "New" },
+    ]);
   });
 });

@@ -23,7 +23,7 @@ export function ApprovalDialog({ send }: { send: (message: ClientMessage) => boo
     if (!approval) return;
     const finalReason = (allowed ? "" : reason.trim() || fallbackReason || "").trim();
     if (!allowed && !finalReason) {
-      setError("Reject reason is required.");
+      setError("拒绝时必须填写原因。");
       return;
     }
     send({
@@ -43,26 +43,26 @@ export function ApprovalDialog({ send }: { send: (message: ClientMessage) => boo
     <Dialog
       open={Boolean(approval)}
       onOpenChange={(open) => {
-        if (!open) decide(false, "dismissed in approval dialog");
+        if (!open) decide(false, "已在审批弹窗中关闭");
       }}
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Approve {approval?.kind ?? "operation"}</DialogTitle>
+          <DialogTitle>审批 {approval?.kind ?? "操作"}</DialogTitle>
           <DialogDescription>
-            Review the preview from the local CodeFlow server before continuing.
+            请先查看本地 CodeFlow 服务提供的预览内容，再决定是否继续。
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3 text-sm">
-          {approval?.command ? <Row label="Command" value={approval.command} /> : null}
-          {approval?.path ? <Row label="Path" value={approval.path} /> : null}
-          {approval?.risk ? <Row label="Risk" value={approval.risk} /> : null}
-          {approval?.timeout ? <Row label="Timeout" value={approval.timeout} /> : null}
+          {approval?.command ? <Row label="命令" value={approval.command} /> : null}
+          {approval?.path ? <Row label="路径" value={approval.path} /> : null}
+          {approval?.risk ? <Row label="风险" value={approval.risk} /> : null}
+          {approval?.timeout ? <Row label="超时" value={approval.timeout} /> : null}
           <pre className="max-h-72 overflow-auto rounded-lg bg-[var(--terminal)] p-3 text-xs text-white">
-            {approval?.preview ?? "No preview supplied."}
+            {approval?.preview ?? "未提供预览内容。"}
           </pre>
           <Input
-            placeholder="Reason required when denying"
+            placeholder="拒绝时请填写原因"
             value={reason}
             onChange={(event) => {
               setReason(event.target.value);
@@ -73,9 +73,9 @@ export function ApprovalDialog({ send }: { send: (message: ClientMessage) => boo
         </div>
         <div className="flex justify-end gap-2">
           <Button variant="secondary" onClick={() => decide(false)}>
-            Deny
+            拒绝
           </Button>
-          <Button onClick={() => decide(true)}>Approve</Button>
+          <Button onClick={() => decide(true)}>批准</Button>
         </div>
       </DialogContent>
     </Dialog>

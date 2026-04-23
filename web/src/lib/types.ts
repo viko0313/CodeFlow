@@ -199,3 +199,14 @@ export type UploadedDocument = {
   content: string;
   created_at: string;
 };
+
+export type SessionHistoryTurn = {
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+};
+
+export type SessionHistory = {
+  session_id: string;
+  turns: SessionHistoryTurn[];
+};

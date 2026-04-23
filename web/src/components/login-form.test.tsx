@@ -17,7 +17,7 @@ vi.mock("next-auth/react", () => ({
 describe("LoginForm", () => {
   it("submits local credentials and redirects to the callback", async () => {
     render(<LoginForm />);
-    fireEvent.click(screen.getByRole("button", { name: "Enter workspace" }));
+    fireEvent.click(screen.getByRole("button", { name: "进入工作台" }));
     await waitFor(() => expect(push).toHaveBeenCalledWith("/ide"));
     expect(refresh).toHaveBeenCalled();
   });

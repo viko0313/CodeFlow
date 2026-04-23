@@ -4,8 +4,8 @@ import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Database, FolderGit2, Gauge, PlugZap, Plus, Server, Sparkles } from "lucide-react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   createSession,
   getApprovals,
@@ -38,9 +38,11 @@ export function DashboardClient({ userName }: { userName: string }) {
     refetchInterval: 7000,
   });
   const create = useMutation({
-    mutationFn: () => createSession(`CodeFlow ${new Date().toLocaleTimeString()}`),
+    mutationFn: () => createSession(`会话 ${new Date().toLocaleTimeString()}`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sessions"] }),
   });
+  const skillItems = skills.data?.skills ?? [];
+  const mcpServers = mcp.data?.servers ?? [];
   const metrics = (audit.data ?? []).slice(0, 8).reverse().map((event, index) => ({
     name: `${index + 1}`,
     duration: event.duration_ms ?? 0,
@@ -50,27 +52,26 @@ export function DashboardClient({ userName }: { userName: string }) {
     <div className="mx-auto grid max-w-[1480px] gap-5 px-4 py-5">
       <section className="grid gap-4 rounded-lg border border-[var(--line)] bg-white p-5 md:grid-cols-[1.4fr_1fr]">
         <div>
-          <Badge>Local workspace</Badge>
-          <h1 className="mt-3 text-3xl font-semibold">Good to see you, {userName}.</h1>
+          <Badge>本地工作台</Badge>
+          <h1 className="mt-3 text-3xl font-semibold">欢迎回来，{userName}。</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-[var(--muted)]">
-            Project sessions, runtime health, approvals, and recent execution telemetry are ready
-            from the local CodeFlow server.
+            本地 CodeFlow 服务已经准备好项目会话、运行健康状态、审批数据和最近执行遥测。
           </p>
           <div className="mt-5 flex flex-wrap gap-2">
             <Button asChild>
-              <Link href="/ide">Open IDE</Link>
+              <Link href="/ide">打开 IDE</Link>
             </Button>
             <Button variant="secondary" onClick={() => create.mutate()} disabled={create.isPending}>
               <Plus className="h-4 w-4" />
-              New session
+              新建会话
             </Button>
           </div>
         </div>
         <div className="grid min-h-44 place-items-center rounded-lg bg-[var(--panel-strong)] p-5">
           <div className="grid w-full grid-cols-3 gap-3 text-center">
-            <Metric icon={<Server />} label="API" value={health.data?.status ?? "checking"} />
-            <Metric icon={<Database />} label="Storage" value={health.data?.storage_backend ?? "unknown"} />
-            <Metric icon={<Gauge />} label="Model" value={health.data?.model_configured ? "set" : "unset"} />
+            <Metric icon={<Server />} label="接口" value={health.data?.status ?? "检查中"} />
+            <Metric icon={<Database />} label="存储" value={health.data?.storage_backend ?? "未知"} />
+            <Metric icon={<Gauge />} label="模型" value={health.data?.model_configured ? "已配置" : "未配置"} />
           </div>
         </div>
       </section>
@@ -79,10 +80,10 @@ export function DashboardClient({ userName }: { userName: string }) {
         <div className="rounded-lg border border-[var(--line)] bg-white p-5">
           <div className="mb-4 flex items-center justify-between gap-3">
             <div>
-              <h2 className="text-lg font-semibold">Sessions</h2>
-              <p className="text-sm text-[var(--muted)]">Switch from the IDE when you need another thread.</p>
+              <h2 className="text-lg font-semibold">会话</h2>
+              <p className="text-sm text-[var(--muted)]">需要切换到其他线程时，可以在这里直接进入对应会话。</p>
             </div>
-            <Badge>{sessions.data?.length ?? 0} total</Badge>
+            <Badge>共 {sessions.data?.length ?? 0} 个</Badge>
           </div>
           <div className="grid gap-3">
             {(sessions.data ?? []).map((session) => (
@@ -93,15 +94,15 @@ export function DashboardClient({ userName }: { userName: string }) {
               >
                 <div className="flex items-center justify-between gap-3">
                   <span className="font-medium">{session.title}</span>
-                  {session.active ? <Badge className="border-[var(--accent)] text-[var(--accent-strong)]">Active</Badge> : null}
+                  {session.active ? <Badge className="border-[var(--accent)] text-[var(--accent-strong)]">当前</Badge> : null}
                 </div>
                 <span className="truncate text-xs text-[var(--muted)]">{session.id}</span>
-                <span className="text-xs text-[var(--muted)]">Updated {formatDateTime(session.updated_at)}</span>
+                <span className="text-xs text-[var(--muted)]">更新时间 {formatDateTime(session.updated_at)}</span>
               </Link>
             ))}
             {!sessions.data?.length ? (
               <p className="rounded-lg border border-dashed border-[var(--line)] p-4 text-sm text-[var(--muted)]">
-                No sessions yet. Start one from the button above.
+                还没有会话，点击上方按钮开始创建。
               </p>
             ) : null}
           </div>
@@ -109,40 +110,36 @@ export function DashboardClient({ userName }: { userName: string }) {
 
         <div className="grid gap-5">
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
-            <h2 className="text-lg font-semibold">Runtime</h2>
+            <h2 className="text-lg font-semibold">运行环境</h2>
             <dl className="mt-4 grid gap-3 text-sm">
-              <Row label="Provider" value={config.data?.provider ?? "unknown"} />
-              <Row label="Model" value={config.data?.model ?? "unknown"} />
+              <Row label="提供方" value={config.data?.provider ?? "未知"} />
+              <Row label="模型" value={config.data?.model ?? "未知"} />
               <Row label="Agent" value={config.data?.agent?.mode ?? "react"} />
-              <Row label="Plan" value={config.data?.agent?.plan_enabled ? "enabled" : "toggle in IDE"} />
-              <Row label="Project" value={health.data?.project_root ?? config.data?.project_root ?? "unknown"} />
-              <Row label="Memory" value={health.data?.memory_backend ?? "unknown"} />
-              <Row label="Fallback" value={health.data?.fallback_active ? "active" : "off"} />
+              <Row label="计划模式" value={config.data?.agent?.plan_enabled ? "已启用" : "请在 IDE 中切换"} />
+              <Row label="项目" value={health.data?.project_root ?? config.data?.project_root ?? "未知"} />
+              <Row label="记忆" value={health.data?.memory_backend ?? "未知"} />
+              <Row label="兜底" value={health.data?.fallback_active ? "已开启" : "关闭"} />
             </dl>
           </div>
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
-            <h2 className="text-lg font-semibold">Approvals</h2>
-            <p className="mt-2 text-sm text-[var(--muted)]">
-              Pending: {pendingApprovals.data?.length ?? 0}
-            </p>
+            <h2 className="text-lg font-semibold">审批</h2>
+            <p className="mt-2 text-sm text-[var(--muted)]">待处理：{pendingApprovals.data?.length ?? 0}</p>
             <p className="mt-1 text-sm text-[var(--muted)]">
-              Recent approval events:{" "}
-              {(taskEvents.data ?? []).filter((item) => item.event_type.startsWith("approval.")).length}
+              最近审批事件：{(taskEvents.data ?? []).filter((item) => item.event_type.startsWith("approval.")).length}
             </p>
             <div className="mt-3">
               <Button asChild size="sm" variant="secondary">
-                <Link href="/approvals">Open approval center</Link>
+                <Link href="/approvals">打开审批中心</Link>
               </Button>
             </div>
           </div>
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
             <div className="mb-3 flex items-center gap-2">
               <Sparkles className="h-4 w-4 text-[var(--accent-strong)]" />
-              <h2 className="text-lg font-semibold">Skills</h2>
+              <h2 className="text-lg font-semibold">技能</h2>
             </div>
             <p className="text-sm text-[var(--muted)]">
-              {skills.data?.skills.length ?? 0} discovered,{" "}
-              {skills.data?.skills.filter((skill) => skill.preloaded).length ?? 0} preloaded.
+              已发现 {skillItems.length} 个，其中预加载 {skillItems.filter((skill) => skill.preloaded).length} 个。
             </p>
           </div>
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
@@ -151,14 +148,13 @@ export function DashboardClient({ userName }: { userName: string }) {
               <h2 className="text-lg font-semibold">MCP</h2>
             </div>
             <p className="text-sm text-[var(--muted)]">
-              {mcp.data?.servers.length ?? 0} configured,{" "}
-              {mcp.data?.servers.filter((server) => server.preloaded).length ?? 0} preloaded.
+              已配置 {mcpServers.length} 个，其中预加载 {mcpServers.filter((server) => server.preloaded).length} 个。
             </p>
           </div>
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
             <div className="mb-3 flex items-center gap-2">
               <Activity className="h-4 w-4 text-[var(--accent-strong)]" />
-              <h2 className="text-lg font-semibold">Operation Timing</h2>
+              <h2 className="text-lg font-semibold">操作耗时</h2>
             </div>
             <div className="h-44">
               <ResponsiveContainer width="100%" height="100%">
@@ -178,17 +174,17 @@ export function DashboardClient({ userName }: { userName: string }) {
       <section className="rounded-lg border border-[var(--line)] bg-white p-5">
         <div className="mb-4 flex items-center gap-2">
           <FolderGit2 className="h-4 w-4 text-[var(--accent-strong)]" />
-          <h2 className="text-lg font-semibold">Recent Audit</h2>
+          <h2 className="text-lg font-semibold">最近审计</h2>
         </div>
         <div className="grid gap-2">
           {(audit.data ?? []).map((event, index) => (
             <div key={`${event.time}-${index}`} className="grid gap-1 rounded-lg border border-[var(--line)] p-3 md:grid-cols-[160px_1fr_120px]">
               <span className="text-xs text-[var(--muted)]">{formatDateTime(event.time)}</span>
               <span className="truncate text-sm">{event.args_summary || event.event}</span>
-              <span className="text-xs text-[var(--muted)]">{event.confirmed === false ? "denied" : event.event}</span>
+              <span className="text-xs text-[var(--muted)]">{event.confirmed === false ? "已拒绝" : event.event}</span>
             </div>
           ))}
-          {!audit.data?.length ? <p className="text-sm text-[var(--muted)]">No audit events yet.</p> : null}
+          {!audit.data?.length ? <p className="text-sm text-[var(--muted)]">暂时还没有审计事件。</p> : null}
         </div>
       </section>
     </div>

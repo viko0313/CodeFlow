@@ -21,7 +21,7 @@ export function TerminalPanel({ output }: { output: string }) {
       },
     });
     terminal.open(hostRef.current);
-    terminal.writeln("CodeFlow terminal is ready.");
+    terminal.writeln("CodeFlow 终端已就绪。");
     terminalRef.current = terminal;
     return () => {
       terminal.dispose();
@@ -32,7 +32,7 @@ export function TerminalPanel({ output }: { output: string }) {
   useEffect(() => {
     if (!terminalRef.current) return;
     terminalRef.current.clear();
-    terminalRef.current.writeln("CodeFlow terminal is ready.");
+    terminalRef.current.writeln("CodeFlow 终端已就绪。");
     if (output.trim()) {
       terminalRef.current.write(output.replace(/\n/g, "\r\n"));
     }

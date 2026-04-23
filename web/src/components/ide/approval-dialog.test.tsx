@@ -19,7 +19,7 @@ describe("ApprovalDialog", () => {
     });
     const send = vi.fn(() => true);
     render(<ApprovalDialog send={send} />);
-    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    fireEvent.click(screen.getByRole("button", { name: "批准" }));
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "permission.decide",
@@ -39,13 +39,13 @@ describe("ApprovalDialog", () => {
     });
     const send = vi.fn(() => true);
     render(<ApprovalDialog send={send} />);
-    fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+    fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
     expect(send).not.toHaveBeenCalled();
-    expect(screen.getByText("Reject reason is required.")).toBeInTheDocument();
-    fireEvent.change(screen.getByPlaceholderText("Reason required when denying"), {
+    expect(screen.getByText("拒绝时必须填写原因。")).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("拒绝时请填写原因"), {
       target: { value: "unsafe command" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+    fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "permission.decide",

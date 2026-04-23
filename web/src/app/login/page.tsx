@@ -12,8 +12,8 @@ export default async function LoginPage() {
       <section className="w-full max-w-sm rounded-lg border border-[var(--line)] bg-white p-6 shadow-sm">
         <div className="mb-6">
           <p className="text-sm font-semibold text-[var(--accent-strong)]">CodeFlow</p>
-          <h1 className="mt-2 text-2xl font-semibold">Sign in</h1>
-          <p className="mt-2 text-sm text-[var(--muted)]">Use the local development account.</p>
+          <h1 className="mt-2 text-2xl font-semibold">登录</h1>
+          <p className="mt-2 text-sm text-[var(--muted)]">使用本地开发账号进入工作台。</p>
         </div>
         <LoginForm />
       </section>
