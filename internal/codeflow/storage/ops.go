@@ -1,6 +1,9 @@
 package storage
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type ApprovalStatus string
 
@@ -92,4 +95,50 @@ type ListTaskEventsOptions struct {
 type TaskEventStore interface {
 	CreateTaskEvent(input CreateTaskEventInput) (*TaskEvent, error)
 	ListTaskEvents(opts ListTaskEventsOptions) ([]TaskEvent, error)
+}
+
+type MessageRecord struct {
+	ID         string    `json:"id"`
+	SessionID  string    `json:"session_id"`
+	RequestID  string    `json:"request_id,omitempty"`
+	Role       string    `json:"role"`
+	Content    string    `json:"content"`
+	ToolCallID string    `json:"tool_call_id,omitempty"`
+	ToolName   string    `json:"tool_name,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type MessageSearchResult struct {
+	MessageRecord
+	Snippet string `json:"snippet"`
+}
+
+type MessageStore interface {
+	AppendMessage(ctx context.Context, input MessageRecord) error
+	ListMessages(ctx context.Context, sessionID string, limit int) ([]MessageRecord, error)
+	SearchMessages(ctx context.Context, sessionID, query string, limit int) ([]MessageSearchResult, error)
+}
+
+type ModelConfig struct {
+	ProjectRoot      string    `json:"project_root"`
+	Provider         string    `json:"provider"`
+	Model            string    `json:"model"`
+	BaseURL          string    `json:"base_url"`
+	APIKeyCiphertext string    `json:"-"`
+	APIKeyHint       string    `json:"api_key_hint"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type UpsertModelConfigInput struct {
+	Provider         string
+	Model            string
+	BaseURL          string
+	APIKeyCiphertext *string
+	APIKeyHint       *string
+}
+
+type ModelConfigStore interface {
+	GetModelConfig(projectRoot string) (*ModelConfig, error)
+	UpsertModelConfig(projectRoot string, input UpsertModelConfigInput) (*ModelConfig, error)
 }

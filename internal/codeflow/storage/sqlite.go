@@ -91,6 +91,27 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 CREATE INDEX IF NOT EXISTS idx_task_events_created ON task_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_events_session_created ON task_events(session_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  request_id TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  tool_call_id TEXT NOT NULL DEFAULT '',
+  tool_name TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_messages_session_created ON codeflow_messages(session_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_model_configs (
+  project_root TEXT PRIMARY KEY,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  base_url TEXT NOT NULL DEFAULT '',
+  api_key_ciphertext TEXT NOT NULL DEFAULT '',
+  api_key_hint TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `)
 	return err
 }
@@ -193,7 +214,15 @@ WHERE project_root=? AND id=?
 }
 
 func (s *SQLiteSessionStore) Delete(projectRoot, sessionID string) error {
-	result, err := s.db.Exec(`DELETE FROM codeflow_sessions WHERE project_root=? AND id=?`, projectRoot, sessionID)
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM codeflow_messages WHERE session_id=?`, sessionID); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM codeflow_sessions WHERE project_root=? AND id=?`, projectRoot, sessionID)
 	if err != nil {
 		return err
 	}
@@ -201,7 +230,7 @@ func (s *SQLiteSessionStore) Delete(projectRoot, sessionID string) error {
 	if rows == 0 {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *SQLiteSessionStore) CreateApproval(input CreateApprovalInput) (*ApprovalRecord, error) {
@@ -380,10 +409,138 @@ LIMIT ?
 	return out, rows.Err()
 }
 
+func (s *SQLiteSessionStore) AppendMessage(ctx context.Context, input MessageRecord) error {
+	id := strings.TrimSpace(input.ID)
+	if id == "" {
+		id = "msg_" + uuid.NewString()[:8]
+	}
+	createdAt := input.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO codeflow_messages (id, session_id, request_id, role, content, tool_call_id, tool_name, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`, id, input.SessionID, input.RequestID, input.Role, input.Content, input.ToolCallID, input.ToolName, formatTS(createdAt))
+	return err
+}
+
+func (s *SQLiteSessionStore) ListMessages(ctx context.Context, sessionID string, limit int) ([]MessageRecord, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, session_id, request_id, role, content, tool_call_id, tool_name, created_at
+FROM codeflow_messages
+WHERE session_id=?
+ORDER BY created_at DESC, id DESC
+LIMIT ?
+`, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]MessageRecord, 0, limit)
+	for rows.Next() {
+		item, scanErr := scanSQLiteMessage(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, *item)
+	}
+	reverseMessages(out)
+	return out, rows.Err()
+}
+
+func (s *SQLiteSessionStore) SearchMessages(ctx context.Context, sessionID, query string, limit int) ([]MessageSearchResult, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return []MessageSearchResult{}, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, session_id, request_id, role, content, tool_call_id, tool_name, created_at
+FROM codeflow_messages
+WHERE session_id=? AND lower(content) LIKE lower(?)
+ORDER BY created_at DESC, id DESC
+LIMIT ?
+`, sessionID, "%"+query+"%", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]MessageSearchResult, 0, limit)
+	for rows.Next() {
+		item, scanErr := scanSQLiteMessage(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, MessageSearchResult{MessageRecord: *item, Snippet: snippet(item.Content, query)})
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLiteSessionStore) Close() {
 	if s.db != nil {
 		_ = s.db.Close()
 	}
+}
+
+func (s *SQLiteSessionStore) GetModelConfig(projectRoot string) (*ModelConfig, error) {
+	row := s.db.QueryRow(`
+SELECT project_root, provider, model, base_url, api_key_ciphertext, api_key_hint, created_at, updated_at
+FROM codeflow_model_configs
+WHERE project_root=?
+`, projectRoot)
+	item, err := scanSQLiteModelConfig(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return item, err
+}
+
+func (s *SQLiteSessionStore) UpsertModelConfig(projectRoot string, input UpsertModelConfigInput) (*ModelConfig, error) {
+	now := time.Now().UTC()
+	if input.APIKeyCiphertext == nil && input.APIKeyHint == nil {
+		_, err := s.db.Exec(`
+INSERT INTO codeflow_model_configs (project_root, provider, model, base_url, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(project_root) DO UPDATE SET
+  provider=excluded.provider,
+  model=excluded.model,
+  base_url=excluded.base_url,
+  updated_at=excluded.updated_at
+`, projectRoot, input.Provider, input.Model, input.BaseURL, formatTS(now), formatTS(now))
+		if err != nil {
+			return nil, err
+		}
+		return s.GetModelConfig(projectRoot)
+	}
+	apiKeyCiphertext := ""
+	apiKeyHint := ""
+	if input.APIKeyCiphertext != nil {
+		apiKeyCiphertext = *input.APIKeyCiphertext
+	}
+	if input.APIKeyHint != nil {
+		apiKeyHint = *input.APIKeyHint
+	}
+	_, err := s.db.Exec(`
+INSERT INTO codeflow_model_configs (project_root, provider, model, base_url, api_key_ciphertext, api_key_hint, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(project_root) DO UPDATE SET
+  provider=excluded.provider,
+  model=excluded.model,
+  base_url=excluded.base_url,
+  api_key_ciphertext=excluded.api_key_ciphertext,
+  api_key_hint=excluded.api_key_hint,
+  updated_at=excluded.updated_at
+`, projectRoot, input.Provider, input.Model, input.BaseURL, apiKeyCiphertext, apiKeyHint, formatTS(now), formatTS(now))
+	if err != nil {
+		return nil, err
+	}
+	return s.GetModelConfig(projectRoot)
 }
 
 type sqliteScanner interface {
@@ -463,6 +620,50 @@ func scanSQLiteTaskEvent(row sqliteScanner) (*TaskEvent, error) {
 		return nil, err
 	}
 	item.CreatedAt = parseTS(createdAt)
+	return &item, nil
+}
+
+func scanSQLiteMessage(row sqliteScanner) (*MessageRecord, error) {
+	var (
+		item      MessageRecord
+		createdAt string
+	)
+	if err := row.Scan(
+		&item.ID,
+		&item.SessionID,
+		&item.RequestID,
+		&item.Role,
+		&item.Content,
+		&item.ToolCallID,
+		&item.ToolName,
+		&createdAt,
+	); err != nil {
+		return nil, err
+	}
+	item.CreatedAt = parseTS(createdAt)
+	return &item, nil
+}
+
+func scanSQLiteModelConfig(row sqliteScanner) (*ModelConfig, error) {
+	var (
+		item      ModelConfig
+		createdAt string
+		updatedAt string
+	)
+	if err := row.Scan(
+		&item.ProjectRoot,
+		&item.Provider,
+		&item.Model,
+		&item.BaseURL,
+		&item.APIKeyCiphertext,
+		&item.APIKeyHint,
+		&createdAt,
+		&updatedAt,
+	); err != nil {
+		return nil, err
+	}
+	item.CreatedAt = parseTS(createdAt)
+	item.UpdatedAt = parseTS(updatedAt)
 	return &item, nil
 }
 

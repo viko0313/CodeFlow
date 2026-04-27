@@ -89,11 +89,83 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 CREATE INDEX IF NOT EXISTS idx_task_events_created ON task_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_events_session_created ON task_events(session_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  request_id TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  tool_call_id TEXT NOT NULL DEFAULT '',
+  tool_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_messages_session_created ON codeflow_messages(session_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_model_configs (
+  project_root TEXT PRIMARY KEY,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  base_url TEXT NOT NULL DEFAULT '',
+  api_key_ciphertext TEXT NOT NULL DEFAULT '',
+  api_key_hint TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
 `)
 	if err != nil {
 		return fmt.Errorf("migrate CodeFlow session schema: %w", err)
 	}
 	return nil
+}
+
+func (s *PostgresSessionStore) GetModelConfig(projectRoot string) (*ModelConfig, error) {
+	row := s.pool.QueryRow(s.ctx, `
+SELECT project_root, provider, model, base_url, api_key_ciphertext, api_key_hint, created_at, updated_at
+FROM codeflow_model_configs
+WHERE project_root=$1
+`, projectRoot)
+	item, err := scanModelConfig(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return item, err
+}
+
+func (s *PostgresSessionStore) UpsertModelConfig(projectRoot string, input UpsertModelConfigInput) (*ModelConfig, error) {
+	now := time.Now().UTC()
+	apiKeyCiphertext := ""
+	apiKeyHint := ""
+	if input.APIKeyCiphertext != nil {
+		apiKeyCiphertext = *input.APIKeyCiphertext
+	}
+	if input.APIKeyHint != nil {
+		apiKeyHint = *input.APIKeyHint
+	}
+	if input.APIKeyCiphertext == nil && input.APIKeyHint == nil {
+		row := s.pool.QueryRow(s.ctx, `
+INSERT INTO codeflow_model_configs (project_root, provider, model, base_url, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$5)
+ON CONFLICT (project_root) DO UPDATE SET
+  provider=EXCLUDED.provider,
+  model=EXCLUDED.model,
+  base_url=EXCLUDED.base_url,
+  updated_at=EXCLUDED.updated_at
+RETURNING project_root, provider, model, base_url, api_key_ciphertext, api_key_hint, created_at, updated_at
+`, projectRoot, input.Provider, input.Model, input.BaseURL, now)
+		return scanModelConfig(row)
+	}
+	row := s.pool.QueryRow(s.ctx, `
+INSERT INTO codeflow_model_configs (project_root, provider, model, base_url, api_key_ciphertext, api_key_hint, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
+ON CONFLICT (project_root) DO UPDATE SET
+  provider=EXCLUDED.provider,
+  model=EXCLUDED.model,
+  base_url=EXCLUDED.base_url,
+  api_key_ciphertext=EXCLUDED.api_key_ciphertext,
+  api_key_hint=EXCLUDED.api_key_hint,
+  updated_at=EXCLUDED.updated_at
+RETURNING project_root, provider, model, base_url, api_key_ciphertext, api_key_hint, created_at, updated_at
+`, projectRoot, input.Provider, input.Model, input.BaseURL, apiKeyCiphertext, apiKeyHint, now)
+	return scanModelConfig(row)
 }
 
 func (s *PostgresSessionStore) Create(projectRoot, title, agentMD string) (*cfsession.Session, error) {
@@ -185,14 +257,22 @@ RETURNING id, project_root, title, agent_md, active, created_at, updated_at
 }
 
 func (s *PostgresSessionStore) Delete(projectRoot, sessionID string) error {
-	tag, err := s.pool.Exec(s.ctx, `DELETE FROM codeflow_sessions WHERE project_root=$1 AND id=$2`, projectRoot, sessionID)
+	tx, err := s.pool.Begin(s.ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(s.ctx)
+	if _, err := tx.Exec(s.ctx, `DELETE FROM codeflow_messages WHERE session_id=$1`, sessionID); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(s.ctx, `DELETE FROM codeflow_sessions WHERE project_root=$1 AND id=$2`, projectRoot, sessionID)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
-	return nil
+	return tx.Commit(s.ctx)
 }
 
 func (s *PostgresSessionStore) Close() {
@@ -383,6 +463,79 @@ LIMIT $2
 	return out, rows.Err()
 }
 
+func (s *PostgresSessionStore) AppendMessage(ctx context.Context, input MessageRecord) error {
+	id := strings.TrimSpace(input.ID)
+	if id == "" {
+		id = "msg_" + uuid.NewString()[:8]
+	}
+	createdAt := input.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO codeflow_messages (id, session_id, request_id, role, content, tool_call_id, tool_name, created_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+`, id, input.SessionID, input.RequestID, input.Role, input.Content, input.ToolCallID, input.ToolName, createdAt)
+	return err
+}
+
+func (s *PostgresSessionStore) ListMessages(ctx context.Context, sessionID string, limit int) ([]MessageRecord, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT id, session_id, request_id, role, content, tool_call_id, tool_name, created_at
+FROM codeflow_messages
+WHERE session_id=$1
+ORDER BY created_at DESC, id DESC
+LIMIT $2
+`, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]MessageRecord, 0, limit)
+	for rows.Next() {
+		item, scanErr := scanMessage(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, *item)
+	}
+	reverseMessages(out)
+	return out, rows.Err()
+}
+
+func (s *PostgresSessionStore) SearchMessages(ctx context.Context, sessionID, query string, limit int) ([]MessageSearchResult, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return []MessageSearchResult{}, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT id, session_id, request_id, role, content, tool_call_id, tool_name, created_at
+FROM codeflow_messages
+WHERE session_id=$1 AND content ILIKE $2
+ORDER BY created_at DESC, id DESC
+LIMIT $3
+`, sessionID, "%"+query+"%", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]MessageSearchResult, 0, limit)
+	for rows.Next() {
+		item, scanErr := scanMessage(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, MessageSearchResult{MessageRecord: *item, Snippet: snippet(item.Content, query)})
+	}
+	return out, rows.Err()
+}
+
 type scanner interface {
 	Scan(dest ...any) error
 }
@@ -438,6 +591,66 @@ func scanTaskEvent(row scanner) (*TaskEvent, error) {
 		return nil, err
 	}
 	return &item, nil
+}
+
+func scanMessage(row scanner) (*MessageRecord, error) {
+	var item MessageRecord
+	if err := row.Scan(
+		&item.ID,
+		&item.SessionID,
+		&item.RequestID,
+		&item.Role,
+		&item.Content,
+		&item.ToolCallID,
+		&item.ToolName,
+		&item.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func scanModelConfig(row scanner) (*ModelConfig, error) {
+	var item ModelConfig
+	if err := row.Scan(
+		&item.ProjectRoot,
+		&item.Provider,
+		&item.Model,
+		&item.BaseURL,
+		&item.APIKeyCiphertext,
+		&item.APIKeyHint,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func reverseMessages(items []MessageRecord) {
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
+}
+
+func snippet(content, query string) string {
+	content = strings.TrimSpace(content)
+	if len(content) <= 180 {
+		return content
+	}
+	idx := strings.Index(strings.ToLower(content), strings.ToLower(query))
+	if idx < 0 {
+		return content[:180]
+	}
+	start := idx - 60
+	if start < 0 {
+		start = 0
+	}
+	end := start + 180
+	if end > len(content) {
+		end = len(content)
+	}
+	return content[start:end]
 }
 
 func newSessionID(projectRoot string) string {
