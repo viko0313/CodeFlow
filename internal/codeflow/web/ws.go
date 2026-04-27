@@ -164,6 +164,7 @@ func (c *wsClient) runChat(ctx context.Context, msg clientMessage) {
 	})
 	events, err := c.server.engine.Run(runCtx, engine.Request{
 		SessionID:   c.sessionID,
+		RequestID:   c.requestID,
 		ProjectRoot: c.server.root,
 		Input:       input,
 		AgentMD:     c.server.agentMD,

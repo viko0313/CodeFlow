@@ -242,8 +242,12 @@ func runStart(ctx context.Context, opts *appOptions) error {
 	if candidate, ok := store.(storage.TaskEventStore); ok {
 		eventStore = candidate
 	}
+	var messageStore storage.MessageStore
+	if candidate, ok := store.(storage.MessageStore); ok {
+		messageStore = candidate
+	}
 	executor := cftools.NewExecutor(gate, auditor, approvalStore, eventStore)
-	llm, err := engine.New(ctx, cfg, shortMemory)
+	llm, err := engine.New(ctx, cfg, shortMemory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
 	if err != nil {
 		return err
 	}
@@ -367,7 +371,7 @@ func handleInput(ctx context.Context, input string, llm engine.Engine, memory cf
 }
 
 func runPrompt(ctx context.Context, llm engine.Engine, session *cfsession.Session, root, agentMD, input string) error {
-	events, err := llm.Run(ctx, engine.Request{SessionID: session.ID, ProjectRoot: root, Input: input, AgentMD: agentMD})
+	events, err := llm.Run(ctx, engine.Request{SessionID: session.ID, RequestID: nextRequestID(), ProjectRoot: root, Input: input, AgentMD: agentMD})
 	if err != nil {
 		return err
 	}
