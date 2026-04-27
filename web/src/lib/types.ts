@@ -26,6 +26,8 @@ export type CodeFlowConfig = {
   provider: string;
   model: string;
   base_url: string;
+  api_key_configured: boolean;
+  api_key_hint: string;
   project_root: string;
   data_dir: string;
   storage: {
@@ -198,6 +200,32 @@ export type UploadedDocument = {
   chunks: number;
   content: string;
   created_at: string;
+};
+
+export type TraceEvent = {
+  session_id: string;
+  request_id: string;
+  span_id?: string;
+  parent_span_id?: string;
+  iteration?: number;
+  tool_name?: string;
+  tool_call_id?: string;
+  event_type: string;
+  status?: string;
+  duration_ms?: number;
+  payload?: Record<string, unknown>;
+  error_type?: string;
+  created_at?: string;
+};
+
+export type EvalSummary = {
+  session_id: string;
+  requests: number;
+  tool_calls: number;
+  tool_failures: number;
+  duplicates: number;
+  total_duration_ms: number;
+  final_status: string;
 };
 
 export type SessionHistoryTurn = {

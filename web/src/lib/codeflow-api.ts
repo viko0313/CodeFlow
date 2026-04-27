@@ -3,11 +3,13 @@ import type {
   AuditEvent,
   CodeFlowConfig,
   CodeFlowSession,
+  EvalSummary,
   Health,
   McpManifest,
   SessionHistory,
   SkillManifest,
   TaskEvent,
+  TraceEvent,
   UploadedDocument,
 } from "@/lib/types";
 
@@ -34,6 +36,20 @@ export function getHealth() {
 
 export function getConfig() {
   return request<CodeFlowConfig>("/config");
+}
+
+export type UpdateModelConfigInput = {
+  provider: string;
+  model: string;
+  base_url: string;
+  api_key?: string;
+};
+
+export function updateModelConfig(input: UpdateModelConfigInput) {
+  return request<CodeFlowConfig>("/config/model", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
 }
 
 export async function getSessions() {
@@ -98,6 +114,19 @@ export async function getTaskEvents(params?: { sessionId?: string; limit?: numbe
   if (params?.limit) query.set("limit", String(params.limit));
   const payload = await request<{ events: TaskEvent[] }>(`/task-events${query.size ? `?${query}` : ""}`);
   return payload.events;
+}
+
+export async function getTrace(requestId: string) {
+  const payload = await request<{ request_id: string; trace: TraceEvent[] }>(`/traces/${requestId}`);
+  return payload.trace;
+}
+
+export async function getEvalSummary(params?: { sessionId?: string; limit?: number }) {
+  const query = new URLSearchParams();
+  if (params?.sessionId) query.set("session_id", params.sessionId);
+  if (params?.limit) query.set("limit", String(params.limit));
+  const payload = await request<{ summary: EvalSummary }>(`/eval/summary${query.size ? `?${query}` : ""}`);
+  return payload.summary;
 }
 
 export function getSkills() {

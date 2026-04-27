@@ -1,11 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, Database, FolderGit2, Gauge, PlugZap, Plus, Server, Sparkles } from "lucide-react";
+import { Activity, Database, FolderGit2, Gauge, PlugZap, Plus, Save, Server, Sparkles } from "lucide-react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   createSession,
   getApprovals,
@@ -16,8 +18,16 @@ import {
   getSessions,
   getSkills,
   getTaskEvents,
+  updateModelConfig,
 } from "@/lib/codeflow-api";
 import { formatDateTime } from "@/lib/utils";
+
+type ModelForm = {
+  provider: string;
+  model: string;
+  base_url: string;
+  api_key: string;
+};
 
 export function DashboardClient({ userName }: { userName: string }) {
   const queryClient = useQueryClient();
@@ -37,16 +47,58 @@ export function DashboardClient({ userName }: { userName: string }) {
     queryFn: () => getTaskEvents({ limit: 60 }),
     refetchInterval: 7000,
   });
+
+  const [modelForm, setModelForm] = useState<ModelForm>({
+    provider: "",
+    model: "",
+    base_url: "",
+    api_key: "",
+  });
+
+  useEffect(() => {
+    if (!config.data) return;
+    setModelForm((current) => ({
+      provider: config.data.provider ?? "",
+      model: config.data.model ?? "",
+      base_url: config.data.base_url ?? "",
+      api_key: current.api_key,
+    }));
+  }, [config.data]);
+
   const create = useMutation({
     mutationFn: () => createSession(`会话 ${new Date().toLocaleTimeString()}`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sessions"] }),
   });
+
+  const saveModel = useMutation({
+    mutationFn: () => updateModelConfig(modelForm),
+    onSuccess: (updated) => {
+      setModelForm({
+        provider: updated.provider,
+        model: updated.model,
+        base_url: updated.base_url,
+        api_key: "",
+      });
+      queryClient.invalidateQueries({ queryKey: ["config"] });
+      queryClient.invalidateQueries({ queryKey: ["health"] });
+    },
+  });
+
   const skillItems = skills.data?.skills ?? [];
   const mcpServers = mcp.data?.servers ?? [];
   const metrics = (audit.data ?? []).slice(0, 8).reverse().map((event, index) => ({
     name: `${index + 1}`,
     duration: event.duration_ms ?? 0,
   }));
+
+  function updateModelForm(field: keyof ModelForm, value: string) {
+    setModelForm((current) => ({ ...current, [field]: value }));
+  }
+
+  function submitModelConfig(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    saveModel.mutate();
+  }
 
   return (
     <div className="mx-auto grid max-w-[1480px] gap-5 px-4 py-5">
@@ -55,7 +107,7 @@ export function DashboardClient({ userName }: { userName: string }) {
           <Badge>本地工作台</Badge>
           <h1 className="mt-3 text-3xl font-semibold">欢迎回来，{userName}。</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-[var(--muted)]">
-            本地 CodeFlow 服务已经准备好项目会话、运行健康状态、审批数据和最近执行遥测。
+            本地 CodeFlow 服务已经准备好项目会话、运行健康状态、审批数据和最近执行审计。
           </p>
           <div className="mt-5 flex flex-wrap gap-2">
             <Button asChild>
@@ -110,7 +162,10 @@ export function DashboardClient({ userName }: { userName: string }) {
 
         <div className="grid gap-5">
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
-            <h2 className="text-lg font-semibold">运行环境</h2>
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-lg font-semibold">运行环境</h2>
+              <Badge>{config.data?.api_key_configured ? config.data.api_key_hint || "密钥已保存" : "未保存密钥"}</Badge>
+            </div>
             <dl className="mt-4 grid gap-3 text-sm">
               <Row label="提供方" value={config.data?.provider ?? "未知"} />
               <Row label="模型" value={config.data?.model ?? "未知"} />
@@ -120,7 +175,44 @@ export function DashboardClient({ userName }: { userName: string }) {
               <Row label="记忆" value={health.data?.memory_backend ?? "未知"} />
               <Row label="兜底" value={health.data?.fallback_active ? "已开启" : "关闭"} />
             </dl>
+            <form className="mt-5 grid gap-3 border-t border-[var(--line)] pt-4" onSubmit={submitModelConfig}>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Input
+                  aria-label="提供方"
+                  placeholder="provider"
+                  value={modelForm.provider}
+                  onChange={(event) => updateModelForm("provider", event.target.value)}
+                  required
+                />
+                <Input
+                  aria-label="模型"
+                  placeholder="model"
+                  value={modelForm.model}
+                  onChange={(event) => updateModelForm("model", event.target.value)}
+                  required
+                />
+              </div>
+              <Input
+                aria-label="Base URL"
+                placeholder="base_url"
+                value={modelForm.base_url}
+                onChange={(event) => updateModelForm("base_url", event.target.value)}
+              />
+              <Input
+                aria-label="API Key"
+                placeholder="API key 留空则保留现有密钥"
+                type="password"
+                value={modelForm.api_key}
+                onChange={(event) => updateModelForm("api_key", event.target.value)}
+              />
+              {saveModel.error ? <p className="text-sm text-red-600">{(saveModel.error as Error).message}</p> : null}
+              <Button type="submit" size="sm" disabled={saveModel.isPending}>
+                <Save className="h-4 w-4" />
+                保存模型配置
+              </Button>
+            </form>
           </div>
+
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
             <h2 className="text-lg font-semibold">审批</h2>
             <p className="mt-2 text-sm text-[var(--muted)]">待处理：{pendingApprovals.data?.length ?? 0}</p>
@@ -133,6 +225,7 @@ export function DashboardClient({ userName }: { userName: string }) {
               </Button>
             </div>
           </div>
+
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
             <div className="mb-3 flex items-center gap-2">
               <Sparkles className="h-4 w-4 text-[var(--accent-strong)]" />
@@ -142,6 +235,7 @@ export function DashboardClient({ userName }: { userName: string }) {
               已发现 {skillItems.length} 个，其中预加载 {skillItems.filter((skill) => skill.preloaded).length} 个。
             </p>
           </div>
+
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
             <div className="mb-3 flex items-center gap-2">
               <PlugZap className="h-4 w-4 text-[var(--accent-strong)]" />
@@ -151,6 +245,7 @@ export function DashboardClient({ userName }: { userName: string }) {
               已配置 {mcpServers.length} 个，其中预加载 {mcpServers.filter((server) => server.preloaded).length} 个。
             </p>
           </div>
+
           <div className="rounded-lg border border-[var(--line)] bg-white p-5">
             <div className="mb-3 flex items-center gap-2">
               <Activity className="h-4 w-4 text-[var(--accent-strong)]" />
