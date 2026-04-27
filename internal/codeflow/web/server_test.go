@@ -294,6 +294,56 @@ func TestSessionHistoryAPI(t *testing.T) {
 	}
 }
 
+func TestModelConfigAPIStoresEncryptedKeyAndRedactsResponse(t *testing.T) {
+	store := newFakeStore(t.TempDir())
+	cfg := testConfig()
+	cfg.ProjectRoot = store.root
+	cfg.DataDir = t.TempDir()
+	server := NewServer(Dependencies{ProjectRoot: store.root, Config: cfg, Store: store, Engine: fakeEngine{}, Memory: cfmemory.NewInMemoryShortTermMemory()})
+	baseURL, cleanup := startHertzTestServer(t, server)
+	defer cleanup()
+
+	req, err := http.NewRequest(http.MethodPut, baseURL+"/api/config/model", strings.NewReader(`{
+		"provider":"openai",
+		"model":"gpt-4.1",
+		"base_url":"https://api.openai.com/v1",
+		"api_key":"sk-test-secret-1234"
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("update model config status = %d", resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(payload)
+	if strings.Contains(string(encoded), "sk-test-secret-1234") {
+		t.Fatalf("response leaked plaintext api key: %s", encoded)
+	}
+	if payload["api_key_configured"] != true {
+		t.Fatalf("expected api key configured flag, got %+v", payload)
+	}
+	if server.cfg.Provider != "openai" || server.cfg.Model != "gpt-4.1" || server.cfg.APIKey != "sk-test-secret-1234" {
+		t.Fatalf("server config was not refreshed: %+v", server.cfg)
+	}
+	stored := store.modelConfig
+	if stored == nil {
+		t.Fatal("expected model config to be stored")
+	}
+	if stored.APIKeyCiphertext == "" || strings.Contains(stored.APIKeyCiphertext, "sk-test-secret-1234") {
+		t.Fatalf("api key was not encrypted: %+v", stored)
+	}
+}
+
 func startHertzTestServer(t *testing.T, s *Server) (string, func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -402,6 +452,7 @@ type fakeStore struct {
 	approvals     map[string]storage.ApprovalRecord
 	approvalOrder []string
 	taskEvents    []storage.TaskEvent
+	modelConfig   *storage.ModelConfig
 }
 
 func newFakeStore(root string) *fakeStore {
@@ -414,6 +465,37 @@ func newFakeStore(root string) *fakeStore {
 		},
 		approvals: map[string]storage.ApprovalRecord{},
 	}
+}
+
+func (s *fakeStore) GetModelConfig(projectRoot string) (*storage.ModelConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.modelConfig == nil || s.modelConfig.ProjectRoot != projectRoot {
+		return nil, nil
+	}
+	item := *s.modelConfig
+	return &item, nil
+}
+
+func (s *fakeStore) UpsertModelConfig(projectRoot string, input storage.UpsertModelConfigInput) (*storage.ModelConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	item := storage.ModelConfig{ProjectRoot: projectRoot, Provider: input.Provider, Model: input.Model, BaseURL: input.BaseURL, CreatedAt: now, UpdatedAt: now}
+	if s.modelConfig != nil {
+		item.CreatedAt = s.modelConfig.CreatedAt
+		item.APIKeyCiphertext = s.modelConfig.APIKeyCiphertext
+		item.APIKeyHint = s.modelConfig.APIKeyHint
+	}
+	if input.APIKeyCiphertext != nil {
+		item.APIKeyCiphertext = *input.APIKeyCiphertext
+	}
+	if input.APIKeyHint != nil {
+		item.APIKeyHint = *input.APIKeyHint
+	}
+	s.modelConfig = &item
+	out := item
+	return &out, nil
 }
 
 func (s *fakeStore) Create(projectRoot, title, agentMD string) (*cfsession.Session, error) {

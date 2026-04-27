@@ -56,6 +56,7 @@ type Server struct {
 	logger         *slog.Logger
 	approvals      *approval.Service
 	taskEvents     storage.TaskEventStore
+	modelConfigs   storage.ModelConfigStore
 	storageBackend string
 	memoryBackend  string
 	fallbackActive bool
@@ -120,7 +121,29 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	llm, err := engine.New(ctx, cfg, memory)
+	var approvalStore storage.ApprovalStore
+	var eventStore storage.TaskEventStore
+	var messageStore storage.MessageStore
+	if candidate, ok := store.(storage.ApprovalStore); ok {
+		approvalStore = candidate
+	}
+	if candidate, ok := store.(storage.TaskEventStore); ok {
+		eventStore = candidate
+	}
+	if candidate, ok := store.(storage.MessageStore); ok {
+		messageStore = candidate
+	}
+	if err := applyStoredModelConfig(cfg, root, cfg.DataDir, store); err != nil {
+		return err
+	}
+	gate := permission.NewGate(permission.Options{
+		TrustedCommands: cfg.Permissions.TrustedCommands,
+		TrustedDirs:     cfg.Permissions.TrustedDirs,
+		WritableDirs:    cfg.Permissions.WritableDirs,
+		ForceApproval:   cfg.Permissions.ForceApproval,
+	})
+	executor := cftools.NewExecutor(gate, auditor, approvalStore, eventStore)
+	llm, err := engine.New(ctx, cfg, memory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
 	if err != nil {
 		return err
 	}
@@ -184,12 +207,17 @@ func NewServer(deps Dependencies) *Server {
 	mcpManifest, _ := mcp.Load(cfg.MCP)
 	var approvalStore storage.ApprovalStore
 	var eventStore storage.TaskEventStore
+	var modelConfigStore storage.ModelConfigStore
 	if deps.Store != nil {
 		if candidate, ok := deps.Store.(storage.ApprovalStore); ok {
 			approvalStore = candidate
 		}
 		if candidate, ok := deps.Store.(storage.TaskEventStore); ok {
 			eventStore = candidate
+		}
+		if candidate, ok := deps.Store.(storage.ModelConfigStore); ok {
+			modelConfigStore = candidate
+			_ = applyStoredModelConfig(cfg, projectRoot(deps.ProjectRoot), dataDir, candidate)
 		}
 	}
 	return &Server{
@@ -208,10 +236,33 @@ func NewServer(deps Dependencies) *Server {
 
 		approvals:      approval.NewService(approvalStore),
 		taskEvents:     eventStore,
+		modelConfigs:   modelConfigStore,
 		storageBackend: strings.TrimSpace(deps.StorageBackend),
 		memoryBackend:  strings.TrimSpace(deps.MemoryBackend),
 		fallbackActive: deps.FallbackActive,
 	}
+}
+
+func applyStoredModelConfig(cfg *cfconfig.Config, root, dataDir string, store any) error {
+	modelStore, ok := store.(storage.ModelConfigStore)
+	if !ok || modelStore == nil {
+		return nil
+	}
+	record, err := modelStore.GetModelConfig(root)
+	if err != nil || record == nil {
+		return err
+	}
+	cfg.Provider = record.Provider
+	cfg.Model = record.Model
+	cfg.BaseURL = record.BaseURL
+	if record.APIKeyCiphertext != "" {
+		apiKey, err := decryptAPIKey(dataDir, record.APIKeyCiphertext)
+		if err != nil {
+			return err
+		}
+		cfg.APIKey = apiKey
+	}
+	return nil
 }
 
 func (s *Server) Hertz(addr string) *server.Hertz {
@@ -229,7 +280,7 @@ func (s *Server) Routes(h *server.Hertz) {
 		c.Response.Header.Set("Access-Control-Allow-Origin", "http://localhost:3000")
 		c.Response.Header.Set("Access-Control-Allow-Credentials", "true")
 		c.Response.Header.Set("Access-Control-Allow-Headers", "content-type,x-request-id")
-		c.Response.Header.Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+		c.Response.Header.Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
 		if string(c.Method()) == consts.MethodOptions {
 			c.AbortWithStatus(consts.StatusNoContent)
 			return
@@ -265,6 +316,7 @@ func (s *Server) Routes(h *server.Hertz) {
 	})
 	h.GET("/api/health", s.handleHealth)
 	h.GET("/api/config", s.handleConfig)
+	h.PUT("/api/config/model", s.handleUpdateModelConfig)
 	h.GET("/api/skills", s.handleSkills)
 	h.GET("/api/mcp", s.handleMCP)
 	h.GET("/api/sessions", s.handleSessions)
@@ -277,6 +329,8 @@ func (s *Server) Routes(h *server.Hertz) {
 	h.POST("/api/approvals/:id/approve", s.handleApproveApproval)
 	h.POST("/api/approvals/:id/reject", s.handleRejectApproval)
 	h.GET("/api/task-events", s.handleTaskEvents)
+	h.GET("/api/traces/:request_id", s.handleTraceByRequest)
+	h.GET("/api/eval/summary", s.handleEvalSummary)
 	h.GET("/api/audit/recent", s.handleRecentAudit)
 	h.POST("/api/documents/upload", s.handleDocumentUpload)
 	h.GET("/api/ws", s.handleWS)
@@ -308,12 +362,18 @@ func (s *Server) handleHealth(ctx context.Context, c *app.RequestContext) {
 }
 
 func (s *Server) handleConfig(ctx context.Context, c *app.RequestContext) {
-	writeJSON(c, consts.StatusOK, map[string]any{
-		"provider":     s.cfg.Provider,
-		"model":        s.cfg.Model,
-		"base_url":     s.cfg.BaseURL,
-		"project_root": s.root,
-		"data_dir":     s.cfg.DataDir,
+	writeJSON(c, consts.StatusOK, s.configPayload())
+}
+
+func (s *Server) configPayload() map[string]any {
+	return map[string]any{
+		"provider":           s.cfg.Provider,
+		"model":              s.cfg.Model,
+		"base_url":           s.cfg.BaseURL,
+		"api_key_configured": strings.TrimSpace(s.cfg.APIKey) != "",
+		"api_key_hint":       s.currentAPIKeyHint(),
+		"project_root":       s.root,
+		"data_dir":           s.cfg.DataDir,
 		"storage": map[string]any{
 			"postgres_configured": strings.TrimSpace(s.cfg.Storage.PostgresDSN) != "",
 			"redis_addr":          s.cfg.Storage.RedisAddr,
@@ -330,7 +390,105 @@ func (s *Server) handleConfig(ctx context.Context, c *app.RequestContext) {
 		"skills":    s.cfg.Skills,
 		"mcp":       s.cfg.MCP,
 		"documents": s.cfg.Documents,
+	}
+}
+
+func (s *Server) currentAPIKeyHint() string {
+	if s.modelConfigs != nil {
+		if record, err := s.modelConfigs.GetModelConfig(s.root); err == nil && record != nil {
+			return record.APIKeyHint
+		}
+	}
+	return apiKeyHint(s.cfg.APIKey)
+}
+
+func (s *Server) handleUpdateModelConfig(ctx context.Context, c *app.RequestContext) {
+	if s.modelConfigs == nil {
+		writeError(c, consts.StatusServiceUnavailable, "model config store unavailable")
+		return
+	}
+	var input struct {
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+		BaseURL  string `json:"base_url"`
+		APIKey   string `json:"api_key"`
+	}
+	if err := json.Unmarshal(c.Request.Body(), &input); err != nil {
+		writeError(c, consts.StatusBadRequest, "invalid model config payload")
+		return
+	}
+	input.Provider = strings.TrimSpace(input.Provider)
+	input.Model = strings.TrimSpace(input.Model)
+	input.BaseURL = strings.TrimSpace(input.BaseURL)
+	input.APIKey = strings.TrimSpace(input.APIKey)
+	if input.Provider == "" || input.Model == "" {
+		writeError(c, consts.StatusBadRequest, "provider and model are required")
+		return
+	}
+	upsert := storage.UpsertModelConfigInput{
+		Provider: input.Provider,
+		Model:    input.Model,
+		BaseURL:  input.BaseURL,
+	}
+	if input.APIKey != "" {
+		ciphertext, hint, err := encryptAPIKey(s.dataDir, input.APIKey)
+		if err != nil {
+			writeError(c, consts.StatusInternalServerError, err.Error())
+			return
+		}
+		upsert.APIKeyCiphertext = &ciphertext
+		upsert.APIKeyHint = &hint
+	}
+	record, err := s.modelConfigs.UpsertModelConfig(s.root, upsert)
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	next := *s.cfg
+	next.Provider = record.Provider
+	next.Model = record.Model
+	next.BaseURL = record.BaseURL
+	if record.APIKeyCiphertext != "" {
+		apiKey, err := decryptAPIKey(s.dataDir, record.APIKeyCiphertext)
+		if err != nil {
+			writeError(c, consts.StatusInternalServerError, err.Error())
+			return
+		}
+		next.APIKey = apiKey
+	}
+	if s.memory != nil {
+		llm, err := s.rebuildEngine(ctx, &next)
+		if err != nil {
+			writeError(c, consts.StatusBadRequest, err.Error())
+			return
+		}
+		s.engine = llm
+	}
+	s.cfg = &next
+	writeJSON(c, consts.StatusOK, s.configPayload())
+}
+
+func (s *Server) rebuildEngine(ctx context.Context, cfg *cfconfig.Config) (engine.Engine, error) {
+	var approvalStore storage.ApprovalStore
+	var eventStore storage.TaskEventStore
+	var messageStore storage.MessageStore
+	if candidate, ok := s.store.(storage.ApprovalStore); ok {
+		approvalStore = candidate
+	}
+	if candidate, ok := s.store.(storage.TaskEventStore); ok {
+		eventStore = candidate
+	}
+	if candidate, ok := s.store.(storage.MessageStore); ok {
+		messageStore = candidate
+	}
+	gate := permission.NewGate(permission.Options{
+		TrustedCommands: cfg.Permissions.TrustedCommands,
+		TrustedDirs:     cfg.Permissions.TrustedDirs,
+		WritableDirs:    cfg.Permissions.WritableDirs,
+		ForceApproval:   cfg.Permissions.ForceApproval,
 	})
+	executor := cftools.NewExecutor(gate, s.auditor, approvalStore, eventStore)
+	return engine.New(ctx, cfg, s.memory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
 }
 
 func (s *Server) handleSkills(ctx context.Context, c *app.RequestContext) {
@@ -560,6 +718,49 @@ func (s *Server) handleTaskEvents(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	writeJSON(c, consts.StatusOK, map[string]any{"events": items})
+}
+
+func (s *Server) handleTraceByRequest(ctx context.Context, c *app.RequestContext) {
+	if s.taskEvents == nil {
+		writeError(c, consts.StatusServiceUnavailable, "task event store unavailable")
+		return
+	}
+	requestID := strings.TrimSpace(c.Param("request_id"))
+	if requestID == "" {
+		writeError(c, consts.StatusBadRequest, "request id is required")
+		return
+	}
+	trace, err := storage.NewTraceRecorder(s.taskEvents).ListTrace(ctx, requestID)
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"request_id": requestID, "trace": trace})
+}
+
+func (s *Server) handleEvalSummary(ctx context.Context, c *app.RequestContext) {
+	if s.taskEvents == nil {
+		writeError(c, consts.StatusServiceUnavailable, "task event store unavailable")
+		return
+	}
+	sessionID := strings.TrimSpace(c.Query("session_id"))
+	if sessionID == "" {
+		if s.store != nil {
+			if active, err := s.store.GetActive(s.root); err == nil && active != nil {
+				sessionID = active.ID
+			}
+		}
+	}
+	if sessionID == "" {
+		writeError(c, consts.StatusBadRequest, "session id is required")
+		return
+	}
+	summary, err := storage.NewTraceRecorder(s.taskEvents).SummarizeSession(ctx, sessionID, parseLimit(c.Query("limit"), 1000, 2000))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"summary": summary})
 }
 
 func (s *Server) handleDocumentUpload(ctx context.Context, c *app.RequestContext) {
