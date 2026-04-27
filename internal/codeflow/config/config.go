@@ -25,6 +25,7 @@ type Config struct {
 	Permissions PermissionConfig  `mapstructure:"permissions" yaml:"permissions"`
 	Runtime     RuntimeConfig     `mapstructure:"runtime" yaml:"runtime"`
 	Agent       AgentConfig       `mapstructure:"agent" yaml:"agent"`
+	Delegation  DelegationConfig  `mapstructure:"delegation" yaml:"delegation"`
 	Skills      SkillsConfig      `mapstructure:"skills" yaml:"skills"`
 	MCP         MCPConfig         `mapstructure:"mcp" yaml:"mcp"`
 	Documents   DocumentsConfig   `mapstructure:"documents" yaml:"documents"`
@@ -46,13 +47,20 @@ type PermissionConfig struct {
 }
 
 type RuntimeConfig struct {
-	MaxTurns   int `mapstructure:"max_turns" yaml:"max_turns"`
-	MaxActions int `mapstructure:"max_actions" yaml:"max_actions"`
+	MaxTurns        int `mapstructure:"max_turns" yaml:"max_turns"`
+	MaxActions      int `mapstructure:"max_actions" yaml:"max_actions"`
+	MaxContextTurns int `mapstructure:"max_context_turns" yaml:"max_context_turns"`
 }
 
 type AgentConfig struct {
 	Mode        string `mapstructure:"mode" yaml:"mode"`
 	PlanEnabled bool   `mapstructure:"plan_enabled" yaml:"plan_enabled"`
+}
+
+type DelegationConfig struct {
+	Enabled        bool `mapstructure:"enabled" yaml:"enabled"`
+	MaxDepth       int  `mapstructure:"max_depth" yaml:"max_depth"`
+	TimeoutSeconds int  `mapstructure:"timeout_seconds" yaml:"timeout_seconds"`
 }
 
 type SkillsConfig struct {
@@ -99,8 +107,9 @@ func Default(projectRoot string) Config {
 			RedisDB:     0,
 		},
 		Runtime: RuntimeConfig{
-			MaxTurns:   50,
-			MaxActions: 20,
+			MaxTurns:        50,
+			MaxActions:      20,
+			MaxContextTurns: 40,
 		},
 		Permissions: PermissionConfig{
 			TrustedCommands: []string{},
@@ -111,6 +120,11 @@ func Default(projectRoot string) Config {
 		Agent: AgentConfig{
 			Mode:        "react",
 			PlanEnabled: false,
+		},
+		Delegation: DelegationConfig{
+			Enabled:        false,
+			MaxDepth:       1,
+			TimeoutSeconds: 120,
 		},
 		Skills: SkillsConfig{
 			Enabled:         true,
@@ -166,6 +180,9 @@ func Load(projectRoot string) (*Config, error) {
 	if cfg.Runtime.MaxActions <= 0 {
 		cfg.Runtime.MaxActions = 20
 	}
+	if cfg.Runtime.MaxContextTurns <= 0 {
+		cfg.Runtime.MaxContextTurns = 40
+	}
 	cfg.Agent.Mode = strings.ToLower(strings.TrimSpace(cfg.Agent.Mode))
 	if cfg.Agent.Mode == "" {
 		cfg.Agent.Mode = "react"
@@ -213,9 +230,14 @@ func EnsureProjectConfig(projectRoot string) error {
 		"runtime:",
 		"  max_turns: 50",
 		"  max_actions: 20",
+		"  max_context_turns: 40",
 		"agent:",
 		"  mode: \"react\"",
 		"  plan_enabled: false",
+		"delegation:",
+		"  enabled: false",
+		"  max_depth: 1",
+		"  timeout_seconds: 120",
 		"skills:",
 		"  enabled: true",
 		"  dirs:",
