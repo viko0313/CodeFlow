@@ -251,10 +251,12 @@ func ApplyPatchToolSpec() ToolSpec {
 			}
 			result, err := runtime.Executor.Execute(ctx, Operation{
 				Kind:        permission.OperationWriteFile,
+				WorkspaceID: runtime.WorkspaceID,
 				ProjectRoot: runtime.ProjectRoot,
 				Path:        input.Path,
 				Content:     next,
 				RequestID:   runtime.RequestID,
+				PlanStepID:  runtime.PlanStepID,
 			}, runtime.SessionID)
 			if err != nil {
 				return ToolResult{}, err

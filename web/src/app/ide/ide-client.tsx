@@ -237,6 +237,7 @@ export function IdeClient() {
             <p className="truncate text-xs text-[var(--muted)]">
               {activeSessionId ?? "当前没有活动会话"} / agent {config.data?.agent?.mode ?? "react"}
             </p>
+            <p className="mt-1 truncate text-xs text-[var(--muted)]">项目根：{config.data?.project_root ?? "未知"}</p>
           </div>
           <div className="flex flex-wrap gap-2">
             <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 text-xs font-medium hover:bg-[var(--panel-strong)]">
@@ -281,6 +282,7 @@ export function IdeClient() {
                       <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
                         {getRoleLabel(message.role)}
                       </p>
+                      {message.status ? <p className="mb-2 text-xs text-[var(--accent-strong)]">{message.status}</p> : null}
                       <p className="whitespace-pre-wrap break-words">{message.content}</p>
                     </div>
                   ))}
@@ -384,6 +386,9 @@ export function IdeClient() {
                   {state.timeline.slice(0, 20).map((event, index) => (
                     <div key={`${event.type}-${index}`} className="rounded-md bg-[var(--panel-strong)] px-2 py-1 text-xs">
                       <span className="font-medium">{event.type}</span>
+                      {event.kind || event.tool_name ? <span className="ml-2 text-[var(--muted)]">{event.kind ?? event.tool_name}</span> : null}
+                      {event.content ? <span className="ml-2">{event.content}</span> : null}
+                      {event.duration_ms ? <span className="ml-2 text-[var(--muted)]">{event.duration_ms}ms</span> : null}
                       {event.error ? <span className="ml-2 text-[var(--danger)]">{event.error}</span> : null}
                     </div>
                   ))}

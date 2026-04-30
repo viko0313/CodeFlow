@@ -8,6 +8,10 @@ workspace/
 .codeflow/logs/
 .codeflow/checkpoints/
 .codeflow/runtime/
+.codeflow/secret.key
+.codeflow/*.db
+.codeflow/*.log
+.codeflow/dev-logs/
 web/.next/
 web/node_modules/
 web/.env.local

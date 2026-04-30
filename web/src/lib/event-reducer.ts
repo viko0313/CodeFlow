@@ -4,6 +4,7 @@ export type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  status?: string;
 };
 
 export type EventState = {
@@ -55,13 +56,37 @@ export function reduceServerEvent(state: EventState, event: ServerEvent): EventS
     return { ...state, chat, timeline };
   }
   if (event.type === "chat.output") {
+    const id = event.id ?? crypto.randomUUID();
+    const existing = state.chat.find((message) => message.id === id && message.role === "assistant");
+    if (existing) {
+      return {
+        ...state,
+        chat: state.chat.map((message) =>
+          message.id === id && message.role === "assistant"
+            ? { ...message, content: event.content ?? message.content, status: undefined }
+            : message,
+        ),
+        timeline,
+      };
+    }
     return {
       ...state,
-      chat: [...state.chat, { id: event.id ?? crypto.randomUUID(), role: "assistant", content: event.content ?? "" }],
+      chat: [...state.chat, { id, role: "assistant", content: event.content ?? "" }],
       timeline,
     };
   }
-  if (event.type === "chat.status" || event.type === "chat.stats") {
+  if (event.type === "chat.status" || event.type === "llm.iteration.started" || event.type.startsWith("tool.call.")) {
+    const id = event.id ?? "assistant";
+    const existing = state.chat.find((message) => message.id === id && message.role === "assistant");
+    const status = event.content || event.status || event.type;
+    const chat = existing
+      ? state.chat.map((message) =>
+          message.id === id && message.role === "assistant" ? { ...message, status } : message,
+        )
+      : [...state.chat, { id, role: "assistant" as const, content: "", status }];
+    return { ...state, chat, timeline };
+  }
+  if (event.type === "chat.stats") {
     return { ...state, timeline };
   }
   if (event.type === "terminal.output") {

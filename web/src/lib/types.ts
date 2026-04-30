@@ -84,6 +84,8 @@ export type ServerEvent = {
   approval_id?: string;
   status?: string;
   kind?: string;
+  tool_name?: string;
+  duration_ms?: number;
   path?: string;
   command?: string;
   preview?: string;
@@ -93,7 +95,6 @@ export type ServerEvent = {
   output?: string;
   error?: string;
   reason?: string;
-  duration_ms?: number;
   confirmed?: boolean;
 };
 

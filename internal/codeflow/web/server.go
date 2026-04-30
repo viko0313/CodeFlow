@@ -20,6 +20,7 @@ import (
 
 	"github.com/viko0313/CodeFlow/internal/codeflow/approval"
 	"github.com/viko0313/CodeFlow/internal/codeflow/audit"
+	"github.com/viko0313/CodeFlow/internal/codeflow/checkpoint"
 	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
 	"github.com/viko0313/CodeFlow/internal/codeflow/documents"
 	"github.com/viko0313/CodeFlow/internal/codeflow/engine"
@@ -27,11 +28,14 @@ import (
 	cfmemory "github.com/viko0313/CodeFlow/internal/codeflow/memory"
 	"github.com/viko0313/CodeFlow/internal/codeflow/observability"
 	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
+	"github.com/viko0313/CodeFlow/internal/codeflow/plan"
+	"github.com/viko0313/CodeFlow/internal/codeflow/run"
 	cfsession "github.com/viko0313/CodeFlow/internal/codeflow/session"
 	"github.com/viko0313/CodeFlow/internal/codeflow/skills"
 	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
 	cftools "github.com/viko0313/CodeFlow/internal/codeflow/tools"
 	"github.com/viko0313/CodeFlow/internal/codeflow/version"
+	"github.com/viko0313/CodeFlow/internal/codeflow/workspace"
 )
 
 type Options struct {
@@ -40,18 +44,19 @@ type Options struct {
 }
 
 type Server struct {
-	root    string
-	cfg     *cfconfig.Config
-	store   cfsession.Store
-	memory  cfmemory.ShortTermMemory
-	engine  engine.Engine
-	auditor *audit.Logger
-	agentMD string
-	dataDir string
-	skills  skills.Manifest
-	mcp     mcp.Manifest
-	docs    *documents.Store
-	uploads []documents.UploadedDocument
+	root        string
+	workspaceID string
+	cfg         *cfconfig.Config
+	store       cfsession.Store
+	memory      cfmemory.ShortTermMemory
+	engine      engine.Engine
+	auditor     *audit.Logger
+	agentMD     string
+	dataDir     string
+	skills      skills.Manifest
+	mcp         mcp.Manifest
+	docs        *documents.Store
+	uploads     []documents.UploadedDocument
 
 	logger         *slog.Logger
 	approvals      *approval.Service
@@ -64,6 +69,7 @@ type Server struct {
 
 type Dependencies struct {
 	ProjectRoot string
+	WorkspaceID string
 	Config      *cfconfig.Config
 	Store       cfsession.Store
 	Memory      cfmemory.ShortTermMemory
@@ -108,6 +114,15 @@ func Run(ctx context.Context, opts Options) error {
 		)
 	}
 	agentMD := readAgentMD(root)
+	wsStore, wsCleanup, err := openWorkspaceStore(ctx, root)
+	if err != nil {
+		return err
+	}
+	defer wsCleanup()
+	ws, err := workspace.NewService(wsStore).EnsureRegistered(root)
+	if err != nil {
+		return err
+	}
 	session, err := store.GetActive(root)
 	if err != nil {
 		return err
@@ -124,6 +139,10 @@ func Run(ctx context.Context, opts Options) error {
 	var approvalStore storage.ApprovalStore
 	var eventStore storage.TaskEventStore
 	var messageStore storage.MessageStore
+	var runStore storage.RunStore
+	var summaryStore storage.SummaryStore
+	var checkpointStore storage.CheckpointStore
+	var planStore storage.PlanStore
 	if candidate, ok := store.(storage.ApprovalStore); ok {
 		approvalStore = candidate
 	}
@@ -132,6 +151,18 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	if candidate, ok := store.(storage.MessageStore); ok {
 		messageStore = candidate
+	}
+	if candidate, ok := store.(storage.RunStore); ok {
+		runStore = candidate
+	}
+	if candidate, ok := store.(storage.SummaryStore); ok {
+		summaryStore = candidate
+	}
+	if candidate, ok := store.(storage.CheckpointStore); ok {
+		checkpointStore = candidate
+	}
+	if candidate, ok := store.(storage.PlanStore); ok {
+		planStore = candidate
 	}
 	if err := applyStoredModelConfig(cfg, root, cfg.DataDir, store); err != nil {
 		return err
@@ -143,7 +174,12 @@ func Run(ctx context.Context, opts Options) error {
 		ForceApproval:   cfg.Permissions.ForceApproval,
 	})
 	executor := cftools.NewExecutor(gate, auditor, approvalStore, eventStore)
-	llm, err := engine.New(ctx, cfg, memory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
+	runRecorder := run.NewRecorder(runStore)
+	executor.SetRunRecorder(runRecorder)
+	executor.SetCheckpointService(checkpoint.NewService(checkpointStore, runRecorder))
+	compressor := cfmemory.NewCompressor(summaryStore, runRecorder)
+	planService := plan.NewService(planStore)
+	llm, err := engine.New(ctx, cfg, memory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithSummaryStore(summaryStore), engine.WithMemoryCompressor(compressor), engine.WithPlanService(planService), engine.WithRunRecorder(runRecorder), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
 	if err != nil {
 		return err
 	}
@@ -153,6 +189,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	s := NewServer(Dependencies{
 		ProjectRoot: root,
+		WorkspaceID: ws.ID,
 		Config:      cfg,
 		Store:       store,
 		Memory:      memory,
@@ -221,18 +258,19 @@ func NewServer(deps Dependencies) *Server {
 		}
 	}
 	return &Server{
-		root:    projectRoot(deps.ProjectRoot),
-		cfg:     cfg,
-		store:   deps.Store,
-		memory:  deps.Memory,
-		engine:  deps.Engine,
-		auditor: deps.Auditor,
-		agentMD: deps.AgentMD,
-		dataDir: dataDir,
-		skills:  skillManifest,
-		mcp:     mcpManifest,
-		docs:    documents.NewStore(cfg.Documents),
-		logger:  logger,
+		root:        projectRoot(deps.ProjectRoot),
+		workspaceID: strings.TrimSpace(deps.WorkspaceID),
+		cfg:         cfg,
+		store:       deps.Store,
+		memory:      deps.Memory,
+		engine:      deps.Engine,
+		auditor:     deps.Auditor,
+		agentMD:     deps.AgentMD,
+		dataDir:     dataDir,
+		skills:      skillManifest,
+		mcp:         mcpManifest,
+		docs:        documents.NewStore(cfg.Documents),
+		logger:      logger,
 
 		approvals:      approval.NewService(approvalStore),
 		taskEvents:     eventStore,
@@ -320,6 +358,17 @@ func (s *Server) Routes(h *server.Hertz) {
 	h.GET("/api/skills", s.handleSkills)
 	h.GET("/api/mcp", s.handleMCP)
 	h.GET("/api/sessions", s.handleSessions)
+	h.GET("/api/runs", s.handleRuns)
+	h.GET("/api/runs/:id/events", s.handleRunEvents)
+	h.GET("/api/plans", s.handlePlans)
+	h.POST("/api/plans", s.handleCreatePlan)
+	h.GET("/api/plans/:id", s.handlePlanByID)
+	h.POST("/api/plans/:id/approve", s.handleApprovePlan)
+	h.POST("/api/plans/:id/pause", s.handlePausePlan)
+	h.POST("/api/plans/:id/resume", s.handleResumePlan)
+	h.GET("/api/checkpoints", s.handleCheckpoints)
+	h.GET("/api/checkpoints/:id", s.handleCheckpointByID)
+	h.POST("/api/checkpoints/:id/rewind", s.handleRewindCheckpoint)
 	h.POST("/api/sessions", s.handleCreateSession)
 	h.GET("/api/sessions/:id/history", s.handleSessionHistory)
 	h.POST("/api/sessions/:id/switch", s.handleSwitchSession)
@@ -472,6 +521,10 @@ func (s *Server) rebuildEngine(ctx context.Context, cfg *cfconfig.Config) (engin
 	var approvalStore storage.ApprovalStore
 	var eventStore storage.TaskEventStore
 	var messageStore storage.MessageStore
+	var runStore storage.RunStore
+	var summaryStore storage.SummaryStore
+	var checkpointStore storage.CheckpointStore
+	var planStore storage.PlanStore
 	if candidate, ok := s.store.(storage.ApprovalStore); ok {
 		approvalStore = candidate
 	}
@@ -481,6 +534,18 @@ func (s *Server) rebuildEngine(ctx context.Context, cfg *cfconfig.Config) (engin
 	if candidate, ok := s.store.(storage.MessageStore); ok {
 		messageStore = candidate
 	}
+	if candidate, ok := s.store.(storage.RunStore); ok {
+		runStore = candidate
+	}
+	if candidate, ok := s.store.(storage.SummaryStore); ok {
+		summaryStore = candidate
+	}
+	if candidate, ok := s.store.(storage.CheckpointStore); ok {
+		checkpointStore = candidate
+	}
+	if candidate, ok := s.store.(storage.PlanStore); ok {
+		planStore = candidate
+	}
 	gate := permission.NewGate(permission.Options{
 		TrustedCommands: cfg.Permissions.TrustedCommands,
 		TrustedDirs:     cfg.Permissions.TrustedDirs,
@@ -488,7 +553,12 @@ func (s *Server) rebuildEngine(ctx context.Context, cfg *cfconfig.Config) (engin
 		ForceApproval:   cfg.Permissions.ForceApproval,
 	})
 	executor := cftools.NewExecutor(gate, s.auditor, approvalStore, eventStore)
-	return engine.New(ctx, cfg, s.memory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
+	runRecorder := run.NewRecorder(runStore)
+	executor.SetRunRecorder(runRecorder)
+	executor.SetCheckpointService(checkpoint.NewService(checkpointStore, runRecorder))
+	compressor := cfmemory.NewCompressor(summaryStore, runRecorder)
+	planService := plan.NewService(planStore)
+	return engine.New(ctx, cfg, s.memory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithSummaryStore(summaryStore), engine.WithMemoryCompressor(compressor), engine.WithPlanService(planService), engine.WithRunRecorder(runRecorder), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
 }
 
 func (s *Server) handleSkills(ctx context.Context, c *app.RequestContext) {
@@ -522,6 +592,211 @@ func (s *Server) handleSessions(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	writeJSON(c, consts.StatusOK, map[string]any{"sessions": items})
+}
+
+func (s *Server) handleRuns(ctx context.Context, c *app.RequestContext) {
+	runStore, ok := s.store.(storage.RunStore)
+	if !ok {
+		writeError(c, consts.StatusServiceUnavailable, "run store unavailable")
+		return
+	}
+	items, err := runStore.ListRunRecords(strings.TrimSpace(c.Query("session_id")), strings.TrimSpace(c.Query("workspace_id")), parseLimit(c.Query("limit"), 50, 200))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"runs": items})
+}
+
+func (s *Server) handleRunEvents(ctx context.Context, c *app.RequestContext) {
+	runStore, ok := s.store.(storage.RunStore)
+	if !ok {
+		writeError(c, consts.StatusServiceUnavailable, "run store unavailable")
+		return
+	}
+	events, err := runStore.ListRunEventRecords(strings.TrimSpace(c.Param("id")), parseLimit(c.Query("limit"), 500, 2000))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"events": events})
+}
+
+func (s *Server) handlePlans(ctx context.Context, c *app.RequestContext) {
+	planStore, ok := s.store.(storage.PlanStore)
+	if !ok {
+		writeError(c, consts.StatusServiceUnavailable, "plan store unavailable")
+		return
+	}
+	items, err := planStore.ListPlanRecords(strings.TrimSpace(c.Query("session_id")), strings.TrimSpace(c.Query("workspace_id")), parseLimit(c.Query("limit"), 50, 200))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"plans": items})
+}
+
+func (s *Server) handlePlanByID(ctx context.Context, c *app.RequestContext) {
+	planStore, ok := s.store.(storage.PlanStore)
+	if !ok {
+		writeError(c, consts.StatusServiceUnavailable, "plan store unavailable")
+		return
+	}
+	item, err := planStore.GetPlanRecord(strings.TrimSpace(c.Param("id")))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	if item == nil {
+		writeError(c, consts.StatusNotFound, "plan not found")
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"plan": item})
+}
+
+func (s *Server) handleCreatePlan(ctx context.Context, c *app.RequestContext) {
+	if s.engine == nil || s.store == nil {
+		writeError(c, consts.StatusServiceUnavailable, "engine unavailable")
+		return
+	}
+	var req struct {
+		SessionID string `json:"session_id"`
+		Input     string `json:"input"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		writeError(c, consts.StatusBadRequest, "invalid plan request")
+		return
+	}
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID == "" {
+		if active, err := s.store.GetActive(s.root); err == nil && active != nil {
+			sessionID = active.ID
+		}
+	}
+	if sessionID == "" || strings.TrimSpace(req.Input) == "" {
+		writeError(c, consts.StatusBadRequest, "session_id and input are required")
+		return
+	}
+	events, err := s.engine.Run(ctx, engine.Request{
+		SessionID:   sessionID,
+		RequestID:   observability.RequestIDFromHertz(c),
+		WorkspaceID: s.workspaceID,
+		ProjectRoot: s.root,
+		Input:       req.Input,
+		AgentMD:     s.agentMD,
+		Context:     s.runtimeContext(),
+		PlanEnabled: true,
+	})
+	if err != nil {
+		writeError(c, consts.StatusBadRequest, err.Error())
+		return
+	}
+	content := ""
+	for event := range events {
+		if event.Type == engine.EventOutput {
+			content = event.Content
+		}
+	}
+	planStore, ok := s.store.(storage.PlanStore)
+	if !ok {
+		writeJSON(c, consts.StatusOK, map[string]any{"content": content})
+		return
+	}
+	items, _ := planStore.ListPlanRecords(sessionID, "", 1)
+	writeJSON(c, consts.StatusOK, map[string]any{"content": content, "plans": items})
+}
+
+func (s *Server) handleApprovePlan(ctx context.Context, c *app.RequestContext) {
+	s.handlePlanTransition(ctx, c, "approve")
+}
+
+func (s *Server) handlePausePlan(ctx context.Context, c *app.RequestContext) {
+	s.handlePlanTransition(ctx, c, "pause")
+}
+
+func (s *Server) handleResumePlan(ctx context.Context, c *app.RequestContext) {
+	s.handlePlanTransition(ctx, c, "resume")
+}
+
+func (s *Server) handlePlanTransition(ctx context.Context, c *app.RequestContext, action string) {
+	planStore, ok := s.store.(storage.PlanStore)
+	if !ok {
+		writeError(c, consts.StatusServiceUnavailable, "plan store unavailable")
+		return
+	}
+	svc := plan.NewService(planStore)
+	var (
+		item *plan.Plan
+		err  error
+	)
+	switch action {
+	case "approve":
+		item, err = svc.Approve(c.Param("id"))
+	case "pause":
+		item, err = svc.Pause(c.Param("id"))
+	case "resume":
+		item, err = svc.Resume(c.Param("id"))
+	}
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"plan": item})
+}
+
+func (s *Server) handleCheckpoints(ctx context.Context, c *app.RequestContext) {
+	checkpointStore, ok := s.store.(storage.CheckpointStore)
+	if !ok {
+		writeError(c, consts.StatusServiceUnavailable, "checkpoint store unavailable")
+		return
+	}
+	items, err := checkpointStore.ListCheckpointRecords(strings.TrimSpace(c.Query("session_id")), strings.TrimSpace(c.Query("workspace_id")), parseLimit(c.Query("limit"), 50, 200))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"checkpoints": items})
+}
+
+func (s *Server) handleCheckpointByID(ctx context.Context, c *app.RequestContext) {
+	checkpointStore, ok := s.store.(storage.CheckpointStore)
+	if !ok {
+		writeError(c, consts.StatusServiceUnavailable, "checkpoint store unavailable")
+		return
+	}
+	item, err := checkpointStore.GetCheckpointRecord(c.Param("id"))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	if item == nil {
+		writeError(c, consts.StatusNotFound, "checkpoint not found")
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"checkpoint": item})
+}
+
+func (s *Server) handleRewindCheckpoint(ctx context.Context, c *app.RequestContext) {
+	checkpointStore, ok := s.store.(storage.CheckpointStore)
+	if !ok {
+		writeError(c, consts.StatusServiceUnavailable, "checkpoint store unavailable")
+		return
+	}
+	svc := checkpoint.NewService(checkpointStore, nil)
+	item, err := svc.Get(c.Param("id"))
+	if err != nil {
+		writeError(c, consts.StatusInternalServerError, err.Error())
+		return
+	}
+	if item == nil {
+		writeError(c, consts.StatusNotFound, "checkpoint not found")
+		return
+	}
+	if err := svc.Rewind(ctx, s.root, item); err != nil {
+		writeError(c, consts.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(c, consts.StatusOK, map[string]any{"rewound": item.ID})
 }
 
 func (s *Server) handleCreateSession(ctx context.Context, c *app.RequestContext) {
@@ -876,6 +1151,29 @@ func readAuditFile(path string) ([]audit.Event, error) {
 
 func writeJSON(c *app.RequestContext, status int, payload any) {
 	c.JSON(status, payload)
+}
+
+func openWorkspaceStore(ctx context.Context, root string) (storage.WorkspaceStore, func(), error) {
+	postgresDSN := strings.TrimSpace(os.Getenv("CODEFLOW_POSTGRES_DSN"))
+	if cfg, err := cfconfig.Load(projectRoot(root)); err == nil && strings.TrimSpace(cfg.Storage.PostgresDSN) != "" {
+		postgresDSN = cfg.Storage.PostgresDSN
+	}
+	if postgresDSN != "" {
+		store, err := storage.NewPostgresSessionStore(ctx, postgresDSN)
+		if err == nil {
+			return store, store.Close, nil
+		}
+	}
+	home, _ := os.UserHomeDir()
+	registryDir := filepath.Join(home, ".codeflow")
+	if strings.TrimSpace(home) == "" {
+		registryDir = filepath.Join(projectRoot(root), ".codeflow")
+	}
+	store, err := storage.NewSQLiteSessionStore(filepath.Join(registryDir, "registry.db"))
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, store.Close, nil
 }
 
 func writeError(c *app.RequestContext, status int, message string) {

@@ -37,9 +37,11 @@ type ToolResult struct {
 }
 
 type ToolRuntime struct {
+	WorkspaceID string
 	ProjectRoot string
 	SessionID   string
 	RequestID   string
+	PlanStepID  string
 	Executor    *Executor
 	Todos       *TodoStore
 }
@@ -205,10 +207,12 @@ func RunShellToolSpec() ToolSpec {
 			}
 			result, err := runtime.Executor.Execute(ctx, Operation{
 				Kind:        permission.OperationShell,
+				WorkspaceID: runtime.WorkspaceID,
 				ProjectRoot: runtime.ProjectRoot,
 				Command:     input.Command,
 				Timeout:     seconds(timeout),
 				RequestID:   runtime.RequestID,
+				PlanStepID:  runtime.PlanStepID,
 			}, runtime.SessionID)
 			if err != nil {
 				return ToolResult{}, err
@@ -243,11 +247,13 @@ func WriteFileToolSpec() ToolSpec {
 			}
 			result, err := runtime.Executor.Execute(ctx, Operation{
 				Kind:        permission.OperationWriteFile,
+				WorkspaceID: runtime.WorkspaceID,
 				ProjectRoot: runtime.ProjectRoot,
 				Path:        input.Path,
 				Content:     input.Content,
 				Append:      input.Append,
 				RequestID:   runtime.RequestID,
+				PlanStepID:  runtime.PlanStepID,
 			}, runtime.SessionID)
 			if err != nil {
 				return ToolResult{}, err

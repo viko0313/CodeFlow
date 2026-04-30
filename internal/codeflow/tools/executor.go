@@ -15,7 +15,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/viko0313/CodeFlow/internal/codeflow/audit"
+	"github.com/viko0313/CodeFlow/internal/codeflow/checkpoint"
+	"github.com/viko0313/CodeFlow/internal/codeflow/observability"
 	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
+	"github.com/viko0313/CodeFlow/internal/codeflow/run"
 	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
 )
 
@@ -28,6 +31,8 @@ type Operation struct {
 	Command     string
 	Timeout     time.Duration
 	RequestID   string
+	WorkspaceID string
+	PlanStepID  string
 }
 
 type Result struct {
@@ -42,10 +47,20 @@ type Executor struct {
 	auditor   *audit.Logger
 	approvals storage.ApprovalStore
 	events    storage.TaskEventStore
+	runs      *run.Recorder
+	checks    *checkpoint.Service
 }
 
 func NewExecutor(gate *permission.Gate, auditor *audit.Logger, approvals storage.ApprovalStore, events storage.TaskEventStore) *Executor {
 	return &Executor{gate: gate, auditor: auditor, approvals: approvals, events: events}
+}
+
+func (e *Executor) SetRunRecorder(recorder *run.Recorder) {
+	e.runs = recorder
+}
+
+func (e *Executor) SetCheckpointService(service *checkpoint.Service) {
+	e.checks = service
 }
 
 func (e *Executor) Execute(ctx context.Context, op Operation, sessionID string) (Result, error) {
@@ -96,6 +111,7 @@ func (e *Executor) Execute(ctx context.Context, op Operation, sessionID string) 
 			Message:     "operation is waiting for approval",
 			Payload:     toJSON(map[string]any{"kind": op.Kind, "path": op.Path, "command": op.Command}),
 		})
+		e.emitRunEvent(ctx, op, run.EventApprovalRequested, map[string]any{"kind": op.Kind, "path": op.Path, "command": op.Command, "approval_id": approvalID}, 0)
 	}
 	decision, err := e.gate.Review(ctx, permission.Operation{
 		ID:          id,
@@ -140,6 +156,7 @@ func (e *Executor) Execute(ctx context.Context, op Operation, sessionID string) 
 		Message:     "approval decision recorded",
 		Payload:     toJSON(map[string]any{"allowed": decision.Allowed, "reason": decision.Reason}),
 	})
+	e.emitRunEvent(ctx, op, run.EventApprovalResult, map[string]any{"allowed": decision.Allowed, "reason": decision.Reason, "approval_id": approvalID}, 0)
 	confirmed := decision.Allowed
 	defer e.record(sessionID, op, id, approvalID, start, confirmed, decision.Reason)
 	if !decision.Allowed {
@@ -158,6 +175,9 @@ func (e *Executor) Execute(ctx context.Context, op Operation, sessionID string) 
 	})
 	switch op.Kind {
 	case permission.OperationWriteFile:
+		if e.checks != nil && op.Path != "" {
+			_, _ = e.checks.CreateForWrite(ctx, op.WorkspaceID, sessionID, "", op.PlanStepID, op.ProjectRoot, []string{op.Path}, "pre-write checkpoint")
+		}
 		out, err := e.writeFile(op)
 		e.emitExecutionEvent(sessionID, op, id, approvalID, err)
 		return Result{Output: out, Duration: time.Since(start), Confirmed: true, ApprovalID: approvalID}, err
@@ -279,6 +299,11 @@ func (e *Executor) emitExecutionEvent(sessionID string, op Operation, operationI
 		Message:     message,
 		Payload:     toJSON(payload),
 	})
+	if execErr != nil {
+		e.emitRunEvent(context.Background(), op, run.EventToolError, payload, 0)
+		return
+	}
+	e.emitRunEvent(context.Background(), op, run.EventToolEnd, payload, 0)
 }
 
 func (e *Executor) emitTaskEvent(input storage.CreateTaskEventInput) {
@@ -286,6 +311,24 @@ func (e *Executor) emitTaskEvent(input storage.CreateTaskEventInput) {
 		return
 	}
 	_, _ = e.events.CreateTaskEvent(input)
+}
+
+func (e *Executor) emitRunEvent(ctx context.Context, op Operation, typ run.EventType, payload map[string]any, latency int64) {
+	if e.runs == nil {
+		return
+	}
+	runID := observability.RunIDFromContext(ctx)
+	if strings.TrimSpace(runID) == "" {
+		return
+	}
+	_ = e.runs.Event(ctx, run.RunEvent{
+		RunID:     runID,
+		Type:      typ,
+		Timestamp: time.Now().UTC(),
+		RequestID: op.RequestID,
+		LatencyMS: latency,
+		Payload:   payload,
+	})
 }
 
 func toJSON(v map[string]any) string {

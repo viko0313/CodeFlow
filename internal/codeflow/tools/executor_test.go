@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -22,6 +23,27 @@ func TestExecutorDeniedWriteDoesNotTouchDisk(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "out.txt")); !os.IsNotExist(statErr) {
 		t.Fatalf("file should not exist after denied write: %v", statErr)
+	}
+}
+
+func TestExecutorShellRunsInProjectRoot(t *testing.T) {
+	dir := t.TempDir()
+	gate := permission.NewGate(permission.Options{Confirmer: func(context.Context, permission.Operation) (permission.Decision, error) {
+		return permission.Decision{Allowed: true, Reason: "ok"}, nil
+	}})
+	executor := NewExecutor(gate, nil, nil, nil)
+	command := "pwd"
+	if runtime.GOOS == "windows" {
+		command = "Get-Location"
+	}
+	result, err := executor.Execute(context.Background(), Operation{Kind: permission.OperationShell, ProjectRoot: dir, Command: command}, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalizedOutput := strings.ToLower(filepath.Clean(strings.TrimSpace(result.Output)))
+	normalizedDir := strings.ToLower(filepath.Clean(dir))
+	if !strings.Contains(normalizedOutput, normalizedDir) {
+		t.Fatalf("expected shell to run in %s, got %q", dir, result.Output)
 	}
 }
 

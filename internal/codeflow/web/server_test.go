@@ -208,6 +208,32 @@ func TestWebSocketUnknownMessageValidation(t *testing.T) {
 	}
 }
 
+func TestWebSocketForwardsChatProgressEvents(t *testing.T) {
+	store := newFakeStore(t.TempDir())
+	server := NewServer(Dependencies{ProjectRoot: store.root, Config: testConfig(), Store: store, Engine: progressEngine{}})
+	baseURL, cleanup := startHertzTestServer(t, server)
+	defer cleanup()
+
+	conn := dialWS(t, baseURL, "s1")
+	defer conn.Close()
+	readUntil(t, conn, "session.updated")
+	if err := conn.WriteJSON(clientMessage{Type: "chat.send", ID: "chat1", Input: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if status := readUntil(t, conn, "chat.status"); !strings.Contains(status.Content, "thinking") {
+		t.Fatalf("expected status event, got %+v", status)
+	}
+	if tool := readUntil(t, conn, "tool.call.started"); tool.Kind != "search_code" {
+		t.Fatalf("expected tool progress event, got %+v", tool)
+	}
+	if token := readUntil(t, conn, "chat.token"); token.Content != "partial" {
+		t.Fatalf("expected token event, got %+v", token)
+	}
+	if output := readUntil(t, conn, "chat.output"); output.Content != "final" {
+		t.Fatalf("expected final output, got %+v", output)
+	}
+}
+
 func TestDocumentUploadAPI(t *testing.T) {
 	store := newFakeStore(t.TempDir())
 	cfg := testConfig()
@@ -440,6 +466,19 @@ func (fakeEngine) Run(ctx context.Context, req engine.Request) (<-chan engine.Ev
 	out := make(chan engine.Event, 3)
 	out <- engine.Event{Type: engine.EventStatus, Content: "thinking"}
 	out <- engine.Event{Type: engine.EventToken, Content: "ok"}
+	out <- engine.Event{Type: engine.EventStats, Content: "duration=1ms"}
+	close(out)
+	return out, nil
+}
+
+type progressEngine struct{}
+
+func (progressEngine) Run(ctx context.Context, req engine.Request) (<-chan engine.Event, error) {
+	out := make(chan engine.Event, 5)
+	out <- engine.Event{Type: engine.EventStatus, Content: "thinking"}
+	out <- engine.Event{Type: engine.EventToolStarted, Content: "searching", ToolName: "search_code"}
+	out <- engine.Event{Type: engine.EventToken, Content: "partial"}
+	out <- engine.Event{Type: engine.EventOutput, Content: "final"}
 	out <- engine.Event{Type: engine.EventStats, Content: "duration=1ms"}
 	close(out)
 	return out, nil

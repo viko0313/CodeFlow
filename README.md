@@ -6,7 +6,7 @@ This repository now uses the CodeFlow V2 architecture and naming throughout the 
 
 ## Current Phase
 
-Phase 1 MVP is intentionally focused:
+Phase 1+ MVP now includes the first CodeFlow agent runtime loop upgrades:
 
 - `codeflow` Cobra CLI with `start`, `session`, `config`, and `version` commands.
 - Project-root sessions created from the directory where `codeflow start` runs.
@@ -17,6 +17,12 @@ Phase 1 MVP is intentionally focused:
 - Diff preview before file writes.
 - Shell command preview, working directory, timeout, and risk display before execution.
 - JSONL audit events under `.codeflow/logs`.
+- Provider capability adapters for OpenAI-compatible, Qwen/DashScope, Ark, and Ollama.
+- Workspace registry with active-workspace tracking.
+- Structured plan artifacts with CLI/Web management endpoints.
+- Agent run timeline and run-event recording.
+- Checkpoint snapshots before approved file writes.
+- Session summary memory stored alongside short-term memory.
 - Single primary CLI entrypoint under `cmd/codeflow`.
 - Local Web workspace with Dashboard, IDE, WebSocket approvals, Monaco editor, and Xterm.js terminal.
 
@@ -64,6 +70,25 @@ codeflow start
 codeflow session list
 codeflow session switch <session-id>
 codeflow session delete <session-id>
+codeflow workspace register
+codeflow workspace list
+codeflow workspace switch <workspace-id>
+codeflow workspace current
+codeflow workspace remove <workspace-id>
+codeflow plan create "<goal>"
+codeflow plan list
+codeflow plan get <plan-id>
+codeflow plan approve <plan-id>
+codeflow plan pause <plan-id>
+codeflow plan resume <plan-id>
+codeflow run list
+codeflow run show <run-id>
+codeflow checkpoint list
+codeflow checkpoint show <checkpoint-id>
+codeflow checkpoint rewind <checkpoint-id>
+codeflow memory show
+codeflow memory compress
+codeflow memory clear
 codeflow config get <key>
 codeflow config set <key> <value>
 codeflow version
@@ -204,9 +229,14 @@ cmd/codeflow/                    CodeFlow CLI binary
 internal/codeflow/cli/           Cobra commands and REPL
 internal/codeflow/config/        Project/global config loading and secret policy
 internal/codeflow/engine/        Event-stream engine boundary
+internal/codeflow/provider/      Provider capability adapters
+internal/codeflow/workspace/     Workspace registry model and service
+internal/codeflow/plan/          Structured plan artifacts and service
+internal/codeflow/run/           Agent run timeline model and recorder
+internal/codeflow/checkpoint/    Checkpoint snapshot and rewind service
 internal/codeflow/session/       Session interfaces
 internal/codeflow/storage/       PostgreSQL session store
-internal/codeflow/memory/        Redis short-term memory
+internal/codeflow/memory/        Redis short-term memory and session summaries
 internal/codeflow/permission/    Permission review and safety validation
 internal/codeflow/tools/         Project-root tool executor
 internal/codeflow/audit/         JSONL audit event writer
@@ -219,7 +249,9 @@ internal/model/                  Existing multi-provider model factory
 Phase 1 treats the project root as the work area, but privileged actions are never silent:
 
 - File paths must stay inside the project root.
+- Workspace registration keeps an explicit root path and tool execution always validates against that root.
 - File writes show a diff before writing.
+- Approved file writes create checkpoints before mutation when checkpoint storage is available.
 - Shell commands show command, working directory, timeout, and risk before execution.
 - Dangerous shell patterns such as `python -c`, `node -e`, parent traversal, and recursive destructive deletion are blocked.
 - Allow lists can skip confirmation for trusted commands or directories, but audit logging still records the operation.
@@ -231,6 +263,15 @@ Run all tests:
 
 ```powershell
 go test ./...
+```
+
+Inspect structured runtime data:
+
+```powershell
+codeflow run list
+codeflow plan list
+codeflow checkpoint list
+codeflow memory show
 ```
 
 Run integration tests against local services:

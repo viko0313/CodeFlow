@@ -46,6 +46,32 @@ describe("reduceServerEvent", () => {
     expect(decided.pendingApproval).toBeUndefined();
   });
 
+  it("replaces streamed assistant content with final output instead of duplicating it", () => {
+    const streamed = reduceServerEvent(initialEventState, {
+      type: "chat.token",
+      id: "m1",
+      content: "Hello",
+    });
+    const done = reduceServerEvent(streamed, {
+      type: "chat.output",
+      id: "m1",
+      content: "Hello world",
+    });
+
+    expect(done.chat).toEqual([{ id: "m1", role: "assistant", content: "Hello world" }]);
+  });
+
+  it("records public tool progress events in the timeline", () => {
+    const next = reduceServerEvent(initialEventState, {
+      type: "tool.call.started",
+      id: "m1",
+      tool_name: "search_code",
+      content: "正在调用 search_code",
+    });
+
+    expect(next.timeline[0]).toMatchObject({ type: "tool.call.started", tool_name: "search_code" });
+  });
+
   it("hydrates recent history before realtime events", () => {
     const hydrated = initializeEventState([
       { role: "user", content: "Check README", created_at: "2026-04-22T00:00:00Z" },

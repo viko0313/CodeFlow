@@ -16,6 +16,7 @@ import (
 
 	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
 	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
+	cfprovider "github.com/viko0313/CodeFlow/internal/codeflow/provider"
 	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
 	cftools "github.com/viko0313/CodeFlow/internal/codeflow/tools"
 )
@@ -65,6 +66,7 @@ func TestAgentLoopFeedsToolResultBackToModel(t *testing.T) {
 	}}
 	engine := &LLMEngine{
 		cfg:      &cfconfig.Config{Runtime: cfconfig.RuntimeConfig{MaxActions: 4, MaxContextTurns: 20}, Agent: cfconfig.AgentConfig{Mode: "react"}},
+		adapter:  fakeProviderAdapter{capability: cfprovider.ModelCapability{SupportsToolCall: true, SupportsStreaming: false}},
 		model:    model,
 		registry: registry,
 		logger:   nilLogger(),
@@ -108,6 +110,7 @@ func TestAgentLoopRunsCodingHarnessTools(t *testing.T) {
 	}}
 	engine := &LLMEngine{
 		cfg:      &cfconfig.Config{Runtime: cfconfig.RuntimeConfig{MaxActions: 6, MaxContextTurns: 30}, Agent: cfconfig.AgentConfig{Mode: "react"}},
+		adapter:  fakeProviderAdapter{capability: cfprovider.ModelCapability{SupportsToolCall: true, SupportsStreaming: false}},
 		model:    model,
 		registry: cftools.DefaultRegistry(),
 		executor: executor,
@@ -160,6 +163,7 @@ func TestAgentLoopRecordsTraceAndDuplicateWarnings(t *testing.T) {
 	}}
 	engine := &LLMEngine{
 		cfg:      &cfconfig.Config{Runtime: cfconfig.RuntimeConfig{MaxActions: 6, MaxContextTurns: 20}, Agent: cfconfig.AgentConfig{Mode: "react"}},
+		adapter:  fakeProviderAdapter{capability: cfprovider.ModelCapability{SupportsToolCall: true, SupportsStreaming: false}},
 		model:    model,
 		registry: registry,
 		traces:   traceStore,
@@ -192,6 +196,40 @@ func nilLogger() *slog.Logger {
 type fakeTraceStore struct {
 	events []storage.TraceEvent
 }
+
+type fakeProviderAdapter struct {
+	capability cfprovider.ModelCapability
+}
+
+func (a fakeProviderAdapter) Name() string { return "fake" }
+func (a fakeProviderAdapter) BuildChatModel(ctx context.Context) (einomodel.ChatModel, error) {
+	return nil, nil
+}
+func (a fakeProviderAdapter) NormalizeMessages(messages []*schema.Message) []*schema.Message {
+	return messages
+}
+func (a fakeProviderAdapter) BindTools(model einomodel.ChatModel, tools []*schema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
+	return model.(einomodel.ToolCallingChatModel).WithTools(tools)
+}
+func (a fakeProviderAdapter) Stream(ctx context.Context, model any, messages []*schema.Message, opts ...einomodel.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, errors.New("stream not used")
+}
+func (a fakeProviderAdapter) Generate(ctx context.Context, model any, messages []*schema.Message, opts ...einomodel.Option) (*schema.Message, error) {
+	return model.(interface {
+		Generate(context.Context, []*schema.Message, ...einomodel.Option) (*schema.Message, error)
+	}).Generate(ctx, messages, opts...)
+}
+func (a fakeProviderAdapter) ParseToolCalls(msg *schema.Message) []schema.ToolCall {
+	if msg == nil {
+		return nil
+	}
+	return msg.ToolCalls
+}
+func (a fakeProviderAdapter) NormalizeUsage(msg *schema.Message) cfprovider.Usage {
+	return cfprovider.Usage{}
+}
+func (a fakeProviderAdapter) Capability() cfprovider.ModelCapability { return a.capability }
+func (a fakeProviderAdapter) Config() cfprovider.ProviderConfig      { return cfprovider.ProviderConfig{} }
 
 func (s *fakeTraceStore) RecordTrace(ctx context.Context, event storage.TraceEvent) error {
 	s.events = append(s.events, event)

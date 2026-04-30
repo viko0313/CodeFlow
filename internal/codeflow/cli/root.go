@@ -16,16 +16,20 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/viko0313/CodeFlow/internal/codeflow/audit"
+	"github.com/viko0313/CodeFlow/internal/codeflow/checkpoint"
 	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
 	"github.com/viko0313/CodeFlow/internal/codeflow/engine"
 	cfmemory "github.com/viko0313/CodeFlow/internal/codeflow/memory"
 	"github.com/viko0313/CodeFlow/internal/codeflow/observability"
 	"github.com/viko0313/CodeFlow/internal/codeflow/permission"
+	"github.com/viko0313/CodeFlow/internal/codeflow/plan"
+	"github.com/viko0313/CodeFlow/internal/codeflow/run"
 	cfsession "github.com/viko0313/CodeFlow/internal/codeflow/session"
 	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
 	cftools "github.com/viko0313/CodeFlow/internal/codeflow/tools"
 	"github.com/viko0313/CodeFlow/internal/codeflow/version"
 	"github.com/viko0313/CodeFlow/internal/codeflow/web"
+	"github.com/viko0313/CodeFlow/internal/codeflow/workspace"
 )
 
 type appOptions struct {
@@ -43,7 +47,7 @@ func Execute(args []string) error {
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().StringVar(&opts.projectRoot, "project-root", "", "Project root; defaults to the current directory")
-	root.AddCommand(startCommand(opts), webCommand(opts), sessionCommand(opts), configCommand(opts), versionCommand())
+	root.AddCommand(startCommand(opts), webCommand(opts), sessionCommand(opts), workspaceCommand(opts), planCommand(opts), runCommand(opts), checkpointCommand(opts), memoryCommand(opts), configCommand(opts), versionCommand())
 	root.SetArgs(args)
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
@@ -145,6 +149,112 @@ func sessionCommand(opts *appOptions) *cobra.Command {
 	return cmd
 }
 
+func workspaceCommand(opts *appOptions) *cobra.Command {
+	cmd := &cobra.Command{Use: "workspace", Short: "Manage registered workspaces"}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "register",
+		Short: "Register the current directory or --project-root as a workspace",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, cleanup, err := openWorkspaceStore(cmd.Context(), opts.projectRoot)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			svc := workspace.NewService(store)
+			item, err := svc.EnsureRegistered(projectRoot(opts.projectRoot))
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s %s\n", item.ID, item.RootPath)
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List registered workspaces",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, cleanup, err := openWorkspaceStore(cmd.Context(), opts.projectRoot)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			items, err := workspace.NewService(store).List()
+			if err != nil {
+				return err
+			}
+			if len(items) == 0 {
+				fmt.Println("No registered workspaces.")
+				return nil
+			}
+			for _, item := range items {
+				active := " "
+				if item.Active {
+					active = "*"
+				}
+				fmt.Printf("%s %s  %s  %s\n", active, item.ID, item.Name, item.RootPath)
+			}
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "switch <workspace-id>",
+		Short: "Switch the active workspace",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, cleanup, err := openWorkspaceStore(cmd.Context(), opts.projectRoot)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			item, err := workspace.NewService(store).Switch(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Active workspace: %s %s\n", item.ID, item.RootPath)
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "current",
+		Short: "Show the active workspace",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, cleanup, err := openWorkspaceStore(cmd.Context(), opts.projectRoot)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			item, err := workspace.NewService(store).Current()
+			if err != nil {
+				return err
+			}
+			if item == nil {
+				fmt.Println("No active workspace.")
+				return nil
+			}
+			fmt.Printf("%s %s\n", item.ID, item.RootPath)
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "remove <workspace-id>",
+		Short: "Remove a workspace registry record without deleting files",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, cleanup, err := openWorkspaceStore(cmd.Context(), opts.projectRoot)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			if err := workspace.NewService(store).Remove(args[0]); err != nil {
+				return err
+			}
+			fmt.Printf("Removed workspace: %s\n", args[0])
+			return nil
+		},
+	})
+	return cmd
+}
+
 func configCommand(opts *appOptions) *cobra.Command {
 	cmd := &cobra.Command{Use: "config", Short: "Manage project CodeFlow config"}
 	cmd.AddCommand(&cobra.Command{
@@ -214,6 +324,15 @@ func runStart(ctx context.Context, opts *appOptions) error {
 		)
 	}
 	agentMD := readAgentMD(root)
+	wsStore, wsCleanup, err := openWorkspaceStore(ctx, opts.projectRoot)
+	if err != nil {
+		return err
+	}
+	defer wsCleanup()
+	ws, err := workspace.NewService(wsStore).EnsureRegistered(root)
+	if err != nil {
+		return err
+	}
 	session, err := store.GetActive(root)
 	if err != nil {
 		return err
@@ -243,11 +362,32 @@ func runStart(ctx context.Context, opts *appOptions) error {
 		eventStore = candidate
 	}
 	var messageStore storage.MessageStore
+	var runStore storage.RunStore
+	var summaryStore storage.SummaryStore
+	var checkpointStore storage.CheckpointStore
+	var planStore storage.PlanStore
 	if candidate, ok := store.(storage.MessageStore); ok {
 		messageStore = candidate
 	}
+	if candidate, ok := store.(storage.RunStore); ok {
+		runStore = candidate
+	}
+	if candidate, ok := store.(storage.SummaryStore); ok {
+		summaryStore = candidate
+	}
+	if candidate, ok := store.(storage.CheckpointStore); ok {
+		checkpointStore = candidate
+	}
+	if candidate, ok := store.(storage.PlanStore); ok {
+		planStore = candidate
+	}
 	executor := cftools.NewExecutor(gate, auditor, approvalStore, eventStore)
-	llm, err := engine.New(ctx, cfg, shortMemory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
+	runRecorder := run.NewRecorder(runStore)
+	executor.SetRunRecorder(runRecorder)
+	executor.SetCheckpointService(checkpoint.NewService(checkpointStore, runRecorder))
+	compressor := cfmemory.NewCompressor(summaryStore, runRecorder)
+	planService := plan.NewService(planStore)
+	llm, err := engine.New(ctx, cfg, shortMemory, engine.WithToolExecutor(executor), engine.WithMessageStore(messageStore), engine.WithSummaryStore(summaryStore), engine.WithMemoryCompressor(compressor), engine.WithPlanService(planService), engine.WithRunRecorder(runRecorder), engine.WithTraceStore(storage.NewTraceRecorder(eventStore)))
 	if err != nil {
 		return err
 	}
@@ -260,12 +400,12 @@ func runStart(ctx context.Context, opts *appOptions) error {
 		fmt.Println("Loaded AGENT.md project rules.")
 	}
 	if opts.once != "" {
-		return runPrompt(ctx, llm, session, root, agentMD, opts.once)
+		return runPrompt(ctx, llm, session, ws.ID, root, agentMD, opts.once)
 	}
-	return repl(ctx, llm, shortMemory, executor, store, session, root, agentMD)
+	return repl(ctx, llm, shortMemory, executor, store, session, ws.ID, root, agentMD)
 }
 
-func repl(ctx context.Context, llm engine.Engine, memory cfmemory.ShortTermMemory, executor *cftools.Executor, store cfsession.Store, session *cfsession.Session, root, agentMD string) error {
+func repl(ctx context.Context, llm engine.Engine, memory cfmemory.ShortTermMemory, executor *cftools.Executor, store cfsession.Store, session *cfsession.Session, workspaceID, root, agentMD string) error {
 	reader := bufio.NewReader(os.Stdin)
 	var cancelCurrent context.CancelFunc
 	signals := make(chan os.Signal, 2)
@@ -296,7 +436,7 @@ func repl(ctx context.Context, llm engine.Engine, memory cfmemory.ShortTermMemor
 		}
 		taskCtx, cancel := context.WithCancel(ctx)
 		cancelCurrent = cancel
-		err = handleInput(taskCtx, input, llm, memory, executor, store, session, root, agentMD, reader)
+		err = handleInput(taskCtx, input, llm, memory, executor, store, session, workspaceID, root, agentMD, reader)
 		cancel()
 		cancelCurrent = nil
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -305,9 +445,9 @@ func repl(ctx context.Context, llm engine.Engine, memory cfmemory.ShortTermMemor
 	}
 }
 
-func handleInput(ctx context.Context, input string, llm engine.Engine, memory cfmemory.ShortTermMemory, executor *cftools.Executor, store cfsession.Store, session *cfsession.Session, root, agentMD string, reader *bufio.Reader) error {
+func handleInput(ctx context.Context, input string, llm engine.Engine, memory cfmemory.ShortTermMemory, executor *cftools.Executor, store cfsession.Store, session *cfsession.Session, workspaceID, root, agentMD string, reader *bufio.Reader) error {
 	if !strings.HasPrefix(input, "/") {
-		return runPrompt(ctx, llm, session, root, agentMD, input)
+		return runPrompt(ctx, llm, session, workspaceID, root, agentMD, input)
 	}
 	fields := strings.Fields(input)
 	switch fields[0] {
@@ -326,6 +466,7 @@ func handleInput(ctx context.Context, input string, llm engine.Engine, memory cf
 		command := strings.TrimSpace(strings.TrimPrefix(input, "/run"))
 		result, err := executor.Execute(ctx, cftools.Operation{
 			Kind:        permission.OperationShell,
+			WorkspaceID: workspaceID,
 			ProjectRoot: root,
 			Command:     command,
 			Timeout:     60 * time.Second,
@@ -353,6 +494,7 @@ func handleInput(ctx context.Context, input string, llm engine.Engine, memory cf
 		}
 		result, err := executor.Execute(ctx, cftools.Operation{
 			Kind:        permission.OperationWriteFile,
+			WorkspaceID: workspaceID,
 			ProjectRoot: root,
 			Path:        fields[1],
 			Content:     b.String(),
@@ -370,8 +512,8 @@ func handleInput(ctx context.Context, input string, llm engine.Engine, memory cf
 	return nil
 }
 
-func runPrompt(ctx context.Context, llm engine.Engine, session *cfsession.Session, root, agentMD, input string) error {
-	events, err := llm.Run(ctx, engine.Request{SessionID: session.ID, RequestID: nextRequestID(), ProjectRoot: root, Input: input, AgentMD: agentMD})
+func runPrompt(ctx context.Context, llm engine.Engine, session *cfsession.Session, workspaceID, root, agentMD, input string) error {
+	events, err := llm.Run(ctx, engine.Request{SessionID: session.ID, RequestID: nextRequestID(), WorkspaceID: workspaceID, ProjectRoot: root, Input: input, AgentMD: agentMD})
 	if err != nil {
 		return err
 	}
@@ -445,6 +587,30 @@ func openSessionStore(ctx context.Context, rootFlag string) (cfsession.Store, fu
 		return nil, nil, err
 	}
 	store, _, _, err := storage.OpenSessionStoreWithFallback(ctx, cfg.Storage.PostgresDSN, cfg.DataDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, store.Close, nil
+}
+
+func openWorkspaceStore(ctx context.Context, rootFlag string) (storage.WorkspaceStore, func(), error) {
+	root := projectRoot(rootFlag)
+	postgresDSN := strings.TrimSpace(os.Getenv("CODEFLOW_POSTGRES_DSN"))
+	if cfg, err := cfconfig.Load(root); err == nil && strings.TrimSpace(cfg.Storage.PostgresDSN) != "" {
+		postgresDSN = cfg.Storage.PostgresDSN
+	}
+	if postgresDSN != "" {
+		store, err := storage.NewPostgresSessionStore(ctx, postgresDSN)
+		if err == nil {
+			return store, store.Close, nil
+		}
+	}
+	home, _ := os.UserHomeDir()
+	registryDir := filepath.Join(home, ".codeflow")
+	if strings.TrimSpace(home) == "" {
+		registryDir = filepath.Join(root, ".codeflow")
+	}
+	store, err := storage.NewSQLiteSessionStore(filepath.Join(registryDir, "registry.db"))
 	if err != nil {
 		return nil, nil, err
 	}

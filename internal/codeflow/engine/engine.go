@@ -18,29 +18,42 @@ import (
 	cfconfig "github.com/viko0313/CodeFlow/internal/codeflow/config"
 	cfmemory "github.com/viko0313/CodeFlow/internal/codeflow/memory"
 	"github.com/viko0313/CodeFlow/internal/codeflow/observability"
+	"github.com/viko0313/CodeFlow/internal/codeflow/plan"
+	"github.com/viko0313/CodeFlow/internal/codeflow/provider"
+	"github.com/viko0313/CodeFlow/internal/codeflow/run"
 	"github.com/viko0313/CodeFlow/internal/codeflow/storage"
 	cftools "github.com/viko0313/CodeFlow/internal/codeflow/tools"
-	"github.com/viko0313/CodeFlow/internal/model"
 )
 
 type EventType string
 
 const (
-	EventStatus EventType = "status"
-	EventToken  EventType = "token"
-	EventOutput EventType = "output"
-	EventError  EventType = "error"
-	EventStats  EventType = "stats"
+	EventStatus        EventType = "status"
+	EventToken         EventType = "token"
+	EventOutput        EventType = "output"
+	EventError         EventType = "error"
+	EventStats         EventType = "stats"
+	EventToolStarted   EventType = "tool.started"
+	EventToolCompleted EventType = "tool.completed"
+	EventToolFailed    EventType = "tool.failed"
+	EventIteration     EventType = "iteration"
 )
 
 type Event struct {
-	Type    EventType
-	Content string
+	Type           EventType
+	Content        string
+	ToolName       string
+	ToolCallID     string
+	Iteration      int
+	DurationMillis int64
 }
 
 type Request struct {
 	SessionID     string
 	RequestID     string
+	RunID         string
+	WorkspaceID   string
+	PlanID        string
 	ProjectRoot   string
 	Input         string
 	AgentMD       string
@@ -55,14 +68,19 @@ type Engine interface {
 }
 
 type LLMEngine struct {
-	cfg      *cfconfig.Config
-	model    einomodel.ChatModel
-	memory   cfmemory.ShortTermMemory
-	messages storage.MessageStore
-	traces   storage.TraceStore
-	registry *cftools.ToolRegistry
-	executor *cftools.Executor
-	logger   *slog.Logger
+	cfg        *cfconfig.Config
+	adapter    provider.ProviderAdapter
+	model      einomodel.ChatModel
+	memory     cfmemory.ShortTermMemory
+	messages   storage.MessageStore
+	summaries  storage.SummaryStore
+	compressor *cfmemory.Compressor
+	plans      *plan.Service
+	traces     storage.TraceStore
+	registry   *cftools.ToolRegistry
+	executor   *cftools.Executor
+	runs       *run.Recorder
+	logger     *slog.Logger
 }
 
 type Option func(*LLMEngine)
@@ -99,14 +117,42 @@ func WithToolRegistry(registry *cftools.ToolRegistry) Option {
 	}
 }
 
+func WithRunRecorder(recorder *run.Recorder) Option {
+	return func(e *LLMEngine) {
+		e.runs = recorder
+	}
+}
+
+func WithSummaryStore(store storage.SummaryStore) Option {
+	return func(e *LLMEngine) {
+		e.summaries = store
+	}
+}
+
+func WithMemoryCompressor(compressor *cfmemory.Compressor) Option {
+	return func(e *LLMEngine) {
+		e.compressor = compressor
+	}
+}
+
+func WithPlanService(service *plan.Service) Option {
+	return func(e *LLMEngine) {
+		e.plans = service
+	}
+}
+
 func New(ctx context.Context, cfg *cfconfig.Config, memory cfmemory.ShortTermMemory, opts ...Option) (*LLMEngine, error) {
-	legacyCfg := cfg.ToLegacy()
-	chatModel, err := model.NewProviderManager().CreateChatModel(ctx, legacyCfg)
+	adapter, err := provider.NewAdapter(cfg)
+	if err != nil {
+		return nil, err
+	}
+	chatModel, err := adapter.BuildChatModel(ctx)
 	if err != nil {
 		return nil, err
 	}
 	engine := &LLMEngine{
 		cfg:      cfg,
+		adapter:  adapter,
 		model:    chatModel,
 		memory:   memory,
 		registry: cftools.DefaultRegistry(),
@@ -124,6 +170,22 @@ func (e *LLMEngine) Run(ctx context.Context, req Request) (<-chan Event, error) 
 	go func() {
 		defer close(out)
 		start := time.Now()
+		runRecord := run.AgentRun{
+			ID:            strings.TrimSpace(req.RunID),
+			SessionID:     req.SessionID,
+			WorkspaceID:   req.WorkspaceID,
+			PlanID:        req.PlanID,
+			ModelProvider: e.cfg.Provider,
+			ModelName:     e.cfg.Model,
+		}
+		if e.runs != nil && e.runs.Enabled() {
+			if created, err := e.runs.Start(ctx, runRecord); err == nil && created != nil {
+				runRecord = *created
+				ctx = observability.WithRunID(ctx, runRecord.ID)
+				req.RunID = runRecord.ID
+				_ = e.runs.Event(ctx, run.RunEvent{RunID: runRecord.ID, Type: run.EventUserInput, Timestamp: time.Now().UTC(), RequestID: req.RequestID, Payload: map[string]any{"input": req.Input}})
+			}
+		}
 		e.logger.InfoContext(ctx, "model request started",
 			slog.String("component", "engine"),
 			slog.String("event", "model.request.started"),
@@ -131,21 +193,22 @@ func (e *LLMEngine) Run(ctx context.Context, req Request) (<-chan Event, error) 
 			slog.String("session_id", req.SessionID),
 		)
 		out <- Event{Type: EventStatus, Content: "thinking"}
+		if e.runs != nil && e.runs.Enabled() && req.RunID != "" {
+			_ = e.runs.Event(ctx, run.RunEvent{RunID: req.RunID, Type: run.EventModelStart, Timestamp: time.Now().UTC(), RequestID: req.RequestID})
+		}
 		e.recordMessage(ctx, storage.MessageRecord{SessionID: req.SessionID, RequestID: req.RequestID, Role: string(roleUser), Content: req.Input})
 		if e.shouldUseAgentLoop(ctx, req) {
 			e.runAgentLoop(ctx, req, out, start)
 			return
 		}
 		messages := e.buildMessages(ctx, req, nil)
-		if streamer, ok := e.model.(interface {
-			Stream(context.Context, []*schema.Message, ...einomodel.Option) (*schema.StreamReader[*schema.Message], error)
-		}); ok {
-			if stream, err := streamer.Stream(ctx, messages); err == nil && stream != nil {
+		if e.adapter != nil && e.adapter.Capability().SupportsStreaming {
+			if stream, err := e.adapter.Stream(ctx, e.model, messages); err == nil && stream != nil {
 				e.consumeStream(ctx, stream, out, req, start)
 				return
 			}
 		}
-		resp, err := e.model.Generate(ctx, messages)
+		resp, err := e.adapter.Generate(ctx, e.model, messages)
 		if err != nil {
 			e.logger.ErrorContext(ctx, "model request failed",
 				slog.String("component", "engine"),
@@ -155,12 +218,26 @@ func (e *LLMEngine) Run(ctx context.Context, req Request) (<-chan Event, error) 
 				slog.String("error", err.Error()),
 			)
 			out <- Event{Type: EventError, Content: err.Error()}
+			if e.runs != nil && req.RunID != "" {
+				_, _ = e.runs.Finish(ctx, runRecord, run.StatusFailed, err.Error())
+				_ = e.runs.Event(ctx, run.RunEvent{RunID: req.RunID, Type: run.EventError, Timestamp: time.Now().UTC(), RequestID: req.RequestID, Payload: map[string]any{"error": err.Error()}})
+			}
 			return
 		}
 		content := strings.TrimSpace(resp.Content)
+		if req.PlanEnabled || e.cfg.Agent.PlanEnabled {
+			if created, err := e.persistPlan(req, content); err == nil && created != nil {
+				req.PlanID = created.ID
+			}
+		}
 		e.recordMessage(ctx, storage.MessageRecord{SessionID: req.SessionID, RequestID: req.RequestID, Role: string(roleAssistant), Content: content})
 		out <- Event{Type: EventOutput, Content: content}
 		out <- Event{Type: EventStats, Content: fmt.Sprintf("duration=%s", time.Since(start).Round(time.Millisecond))}
+		if e.runs != nil && req.RunID != "" {
+			_ = e.runs.Event(ctx, run.RunEvent{RunID: req.RunID, Type: run.EventModelEnd, Timestamp: time.Now().UTC(), RequestID: req.RequestID, Payload: map[string]any{"output_chars": len(content)}})
+			runRecord.TotalTokens = e.adapter.NormalizeUsage(resp).TotalTokens
+			_, _ = e.runs.Finish(ctx, runRecord, run.StatusCompleted, "")
+		}
 		e.logger.InfoContext(ctx, "model request completed",
 			slog.String("component", "engine"),
 			slog.String("event", "model.request.completed"),
@@ -174,7 +251,13 @@ func (e *LLMEngine) Run(ctx context.Context, req Request) (<-chan Event, error) 
 }
 
 func (e *LLMEngine) shouldUseAgentLoop(ctx context.Context, req Request) bool {
+	if req.PlanEnabled || e.cfg.Agent.PlanEnabled {
+		return false
+	}
 	if e.registry == nil {
+		return false
+	}
+	if e.adapter == nil || !e.adapter.Capability().SupportsToolCall {
 		return false
 	}
 	if _, ok := e.model.(einomodel.ToolCallingChatModel); !ok {
@@ -204,6 +287,11 @@ func (e *LLMEngine) buildMessages(ctx context.Context, req Request, todos *cftoo
 		}
 	}
 	messages := []*schema.Message{schema.SystemMessage(system)}
+	if e.summaries != nil && req.SessionID != "" {
+		if summary, err := e.summaries.GetSessionSummary(req.SessionID); err == nil && summary != nil && strings.TrimSpace(summary.Summary) != "" {
+			messages = append(messages, schema.SystemMessage("[Session summary]\n"+strings.TrimSpace(summary.Summary)))
+		}
+	}
 	if e.messages != nil {
 		limit := e.cfg.Runtime.MaxContextTurns
 		if limit <= 0 {
@@ -241,13 +329,12 @@ func (e *LLMEngine) runAgentLoop(ctx context.Context, req Request, out chan<- Ev
 		out <- Event{Type: EventError, Content: err.Error()}
 		return
 	}
-	toolModel, ok := e.model.(einomodel.ToolCallingChatModel)
-	if !ok {
+	if e.adapter == nil || !e.adapter.Capability().SupportsToolCall {
 		trace.record(ctx, storage.TraceEvent{EventType: "turn.failed", Status: "error", ErrorType: "model_without_tool_calling"})
 		out <- Event{Type: EventError, Content: "chat model does not support tool calling"}
 		return
 	}
-	modelWithTools, err := toolModel.WithTools(defs)
+	modelWithTools, err := e.adapter.BindTools(e.model, defs)
 	if err != nil {
 		trace.record(ctx, storage.TraceEvent{EventType: "turn.failed", Status: "error", ErrorType: "tool_binding_failed", Payload: map[string]any{"error": err.Error()}})
 		out <- Event{Type: EventError, Content: err.Error()}
@@ -268,7 +355,8 @@ func (e *LLMEngine) runAgentLoop(ctx context.Context, req Request, out chan<- Ev
 	for i := 0; i < maxIterations; i++ {
 		iterationStart := time.Now()
 		trace.record(ctx, storage.TraceEvent{EventType: "llm.iteration.started", Status: "ok", Iteration: i + 1, Payload: map[string]any{"message_count": len(messages)}})
-		resp, err := modelWithTools.Generate(ctx, messages)
+		out <- Event{Type: EventIteration, Content: fmt.Sprintf("正在进行第 %d 轮模型调用", i+1), Iteration: i + 1}
+		resp, err := e.adapter.Generate(ctx, modelWithTools, messages)
 		if err != nil {
 			trace.record(ctx, storage.TraceEvent{EventType: "llm.iteration.failed", Status: "error", Iteration: i + 1, ErrorType: "model_error", DurationMS: time.Since(iterationStart).Milliseconds(), Payload: map[string]any{"error": err.Error()}})
 			trace.record(ctx, storage.TraceEvent{EventType: "turn.failed", Status: "error", ErrorType: "model_error", DurationMS: time.Since(start).Milliseconds()})
@@ -280,6 +368,9 @@ func (e *LLMEngine) runAgentLoop(ctx context.Context, req Request, out chan<- Ev
 				slog.String("error", err.Error()),
 			)
 			out <- Event{Type: EventError, Content: err.Error()}
+			if e.runs != nil && req.RunID != "" {
+				_ = e.runs.Event(ctx, run.RunEvent{RunID: req.RunID, Type: run.EventError, Timestamp: time.Now().UTC(), RequestID: req.RequestID, Payload: map[string]any{"error": err.Error()}})
+			}
 			return
 		}
 		trace.record(ctx, storage.TraceEvent{EventType: "llm.iteration.completed", Status: "ok", Iteration: i + 1, DurationMS: time.Since(iterationStart).Milliseconds(), Payload: map[string]any{"output_chars": len(resp.Content), "tool_calls": len(resp.ToolCalls)}})
@@ -288,6 +379,10 @@ func (e *LLMEngine) runAgentLoop(ctx context.Context, req Request, out chan<- Ev
 			content := strings.TrimSpace(resp.Content)
 			e.recordMessage(ctx, storage.MessageRecord{SessionID: req.SessionID, RequestID: req.RequestID, Role: string(roleAssistant), Content: content})
 			out <- Event{Type: EventOutput, Content: content}
+			if e.runs != nil && req.RunID != "" {
+				_ = e.runs.Event(ctx, run.RunEvent{RunID: req.RunID, Type: run.EventModelEnd, Timestamp: time.Now().UTC(), RequestID: req.RequestID, Payload: map[string]any{"output_chars": len(content), "iterations": i + 1}})
+				_, _ = e.runs.Finish(ctx, run.AgentRun{ID: req.RunID, SessionID: req.SessionID, WorkspaceID: req.WorkspaceID, PlanID: req.PlanID, ModelProvider: e.cfg.Provider, ModelName: e.cfg.Model}, run.StatusCompleted, "")
+			}
 			trace.record(ctx, storage.TraceEvent{EventType: "turn.completed", Status: "ok", DurationMS: time.Since(start).Milliseconds(), Payload: map[string]any{"iterations": i + 1, "tool_calls": toolCalls, "tool_failures": toolFailures, "duplicates": duplicateCount, "output_chars": len(content)}})
 			out <- Event{Type: EventStats, Content: fmt.Sprintf("duration=%s iterations=%d tools=%d duplicates=%d failures=%d", time.Since(start).Round(time.Millisecond), i+1, toolCalls, duplicateCount, toolFailures)}
 			return
@@ -304,6 +399,10 @@ func (e *LLMEngine) runAgentLoop(ctx context.Context, req Request, out chan<- Ev
 				trace.record(ctx, storage.TraceEvent{EventType: "tool.call.duplicate_detected", Status: "warning", Iteration: i + 1, ToolName: call.Function.Name, ToolCallID: call.ID, Payload: map[string]any{"args_hash": argsHash(call.Function.Arguments), "count": callCount}})
 			}
 			trace.record(ctx, storage.TraceEvent{EventType: "tool.call.started", Status: "ok", Iteration: i + 1, ToolName: call.Function.Name, ToolCallID: call.ID, Payload: map[string]any{"args_hash": argsHash(call.Function.Arguments), "args_summary": argsSummary(call.Function.Arguments)}})
+			out <- Event{Type: EventToolStarted, Content: fmt.Sprintf("正在调用 %s", call.Function.Name), ToolName: call.Function.Name, ToolCallID: call.ID, Iteration: i + 1}
+			if e.runs != nil && req.RunID != "" {
+				_ = e.runs.Event(ctx, run.RunEvent{RunID: req.RunID, Type: run.EventToolStart, Timestamp: time.Now().UTC(), RequestID: req.RequestID, Payload: map[string]any{"tool": call.Function.Name, "tool_call_id": call.ID, "iteration": i + 1}})
+			}
 			var result cftools.ToolResult
 			if callCount >= 3 {
 				result = cftools.WarningToolResult(fmt.Sprintf(`{"warning":"duplicate tool call suppressed","tool":%q,"count":%d}`, call.Function.Name, callCount), "duplicate_tool_call")
@@ -311,9 +410,11 @@ func (e *LLMEngine) runAgentLoop(ctx context.Context, req Request, out chan<- Ev
 				trace.record(ctx, storage.TraceEvent{EventType: "tool.call.warning", Status: "warning", Iteration: i + 1, ToolName: call.Function.Name, ToolCallID: call.ID, ErrorType: result.ErrorType, DurationMS: result.DurationMS, Payload: map[string]any{"count": callCount}})
 			} else {
 				result, _ = e.registry.Dispatch(ctx, call, cftools.ToolRuntime{
+					WorkspaceID: req.WorkspaceID,
 					ProjectRoot: req.ProjectRoot,
 					SessionID:   req.SessionID,
 					RequestID:   req.RequestID,
+					PlanStepID:  "",
 					Executor:    e.executor,
 					Todos:       todos,
 				})
@@ -325,6 +426,18 @@ func (e *LLMEngine) runAgentLoop(ctx context.Context, req Request, out chan<- Ev
 					toolFailures++
 				}
 				trace.record(ctx, storage.TraceEvent{EventType: eventType, Status: status, Iteration: i + 1, ToolName: call.Function.Name, ToolCallID: call.ID, ErrorType: result.ErrorType, DurationMS: result.DurationMS, Payload: map[string]any{"result_chars": len(result.Content), "retryable": result.Retryable}})
+				progressType := EventToolCompleted
+				if !result.OK {
+					progressType = EventToolFailed
+				}
+				if e.runs != nil && req.RunID != "" {
+					eventType := run.EventToolEnd
+					if !result.OK {
+						eventType = run.EventToolError
+					}
+					_ = e.runs.Event(ctx, run.RunEvent{RunID: req.RunID, Type: eventType, Timestamp: time.Now().UTC(), RequestID: req.RequestID, LatencyMS: result.DurationMS, Payload: map[string]any{"tool": call.Function.Name, "tool_call_id": call.ID, "ok": result.OK, "error_type": result.ErrorType}})
+				}
+				out <- Event{Type: progressType, Content: fmt.Sprintf("%s 完成，用时 %dms", call.Function.Name, result.DurationMS), ToolName: call.Function.Name, ToolCallID: call.ID, Iteration: i + 1, DurationMillis: result.DurationMS}
 			}
 			toolContent := strings.TrimSpace(result.Content)
 			if toolContent == "" {
@@ -348,6 +461,10 @@ func (e *LLMEngine) runAgentLoop(ctx context.Context, req Request, out chan<- Ev
 	}
 	trace.record(ctx, storage.TraceEvent{EventType: "turn.failed", Status: "error", ErrorType: "budget_exhausted", DurationMS: time.Since(start).Milliseconds(), Payload: map[string]any{"max_iterations": maxIterations, "tool_calls": toolCalls, "tool_failures": toolFailures, "duplicates": duplicateCount}})
 	out <- Event{Type: EventError, Content: fmt.Sprintf("agent iteration budget exhausted after %d iterations", maxIterations)}
+	if e.runs != nil && req.RunID != "" {
+		_ = e.runs.Event(ctx, run.RunEvent{RunID: req.RunID, Type: run.EventError, Timestamp: time.Now().UTC(), RequestID: req.RequestID, Payload: map[string]any{"error": "budget_exhausted"}})
+		_, _ = e.runs.Finish(ctx, run.AgentRun{ID: req.RunID, SessionID: req.SessionID, WorkspaceID: req.WorkspaceID, PlanID: req.PlanID, ModelProvider: e.cfg.Provider, ModelName: e.cfg.Model}, run.StatusFailed, "budget exhausted")
+	}
 }
 
 func (e *LLMEngine) consumeStream(ctx context.Context, stream *schema.StreamReader[*schema.Message], out chan<- Event, req Request, start time.Time) {
@@ -448,9 +565,57 @@ func (e *LLMEngine) compressMessagesIfNeeded(messages []*schema.Message, req Req
 	if strings.TrimSpace(req.Input) != "" {
 		summary += "\nLast user goal: " + strings.TrimSpace(req.Input)
 	}
+	if e.compressor != nil && e.messages != nil && req.SessionID != "" {
+		if records, err := e.messages.ListMessages(context.Background(), req.SessionID, keep); err == nil {
+			_, _ = e.compressor.Compress(context.Background(), req.SessionID, req.WorkspaceID, records)
+		}
+	}
 	out := []*schema.Message{messages[0], schema.SystemMessage(summary)}
 	out = append(out, messages[start:]...)
 	return out
+}
+
+func (e *LLMEngine) persistPlan(req Request, content string) (*plan.Plan, error) {
+	if e.plans == nil || strings.TrimSpace(req.SessionID) == "" {
+		return nil, nil
+	}
+	type planPayload struct {
+		Goal       string              `json:"goal"`
+		Steps      []plan.PlanStep     `json:"steps"`
+		Preference plan.PlanPreference `json:"preference"`
+	}
+	payload := planPayload{}
+	trimmed := strings.TrimSpace(content)
+	if strings.HasPrefix(trimmed, "{") {
+		_ = json.Unmarshal([]byte(trimmed), &payload)
+	}
+	if strings.TrimSpace(payload.Goal) == "" {
+		payload.Goal = req.Input
+	}
+	if len(payload.Steps) == 0 {
+		payload.Steps = []plan.PlanStep{{
+			Title:       "Generated plan",
+			Description: trimmed,
+			Type:        plan.StepSummary,
+			Status:      plan.StepPending,
+		}}
+	}
+	status := plan.StatusPlanning
+	for _, step := range payload.Steps {
+		if step.RequiresApproval {
+			status = plan.StatusWaitingApproval
+			break
+		}
+	}
+	return e.plans.Create(plan.Plan{
+		ID:          req.PlanID,
+		SessionID:   req.SessionID,
+		WorkspaceID: req.WorkspaceID,
+		Goal:        payload.Goal,
+		Status:      status,
+		Steps:       payload.Steps,
+		Preference:  payload.Preference,
+	})
 }
 
 type turnTrace struct {

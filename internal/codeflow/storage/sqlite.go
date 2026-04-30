@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	cfsession "github.com/viko0313/CodeFlow/internal/codeflow/session"
+	"github.com/viko0313/CodeFlow/internal/codeflow/workspace"
 )
 
 type SQLiteSessionStore struct {
@@ -110,6 +112,111 @@ CREATE TABLE IF NOT EXISTS codeflow_model_configs (
   api_key_ciphertext TEXT NOT NULL DEFAULT '',
   api_key_hint TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codeflow_workspaces (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  root_path TEXT NOT NULL UNIQUE,
+  config_path TEXT NOT NULL DEFAULT '',
+  agent_md_path TEXT NOT NULL DEFAULT '',
+  default_branch TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  active INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_opened_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_workspaces_active ON codeflow_workspaces(active, last_opened_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_runs (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL DEFAULT '',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  plan_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT NOT NULL DEFAULT '',
+  model_provider TEXT NOT NULL DEFAULT '',
+  model_name TEXT NOT NULL DEFAULT '',
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  total_cost TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_runs_session_started ON codeflow_runs(session_id, started_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_run_events (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  request_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_run_events_run_time ON codeflow_run_events(run_id, timestamp ASC);
+CREATE TABLE IF NOT EXISTS codeflow_plans (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL DEFAULT '',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  goal TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  preference TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codeflow_plan_steps (
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  requires_approval INTEGER NOT NULL DEFAULT 0,
+  related_files TEXT NOT NULL DEFAULT '[]',
+  tool_calls TEXT NOT NULL DEFAULT '[]',
+  result_summary TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_plan_steps_plan_position ON codeflow_plan_steps(plan_id, position ASC);
+CREATE TABLE IF NOT EXISTS codeflow_plan_events (
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  step_id TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_plan_events_plan_time ON codeflow_plan_events(plan_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_checkpoints (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  run_id TEXT NOT NULL DEFAULT '',
+  plan_step_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  git_head TEXT NOT NULL DEFAULT '',
+  changed_files TEXT NOT NULL DEFAULT '[]',
+  snapshot_path TEXT NOT NULL DEFAULT '',
+  patch_path TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS codeflow_checkpoint_files (
+  id TEXT PRIMARY KEY,
+  checkpoint_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  existed INTEGER NOT NULL DEFAULT 0,
+  is_binary INTEGER NOT NULL DEFAULT 0,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  sha256 TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_checkpoint_files_checkpoint ON codeflow_checkpoint_files(checkpoint_id);
+CREATE TABLE IF NOT EXISTS codeflow_session_summaries (
+  session_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL
 );
 `)
@@ -543,6 +650,139 @@ ON CONFLICT(project_root) DO UPDATE SET
 	return s.GetModelConfig(projectRoot)
 }
 
+func (s *SQLiteSessionStore) Register(rootPath, name string, metadata map[string]string) (*workspace.Workspace, error) {
+	now := time.Now().UTC()
+	id := "ws_" + uuid.NewString()[:8]
+	if existing, err := s.GetWorkspaceByRoot(rootPath); err != nil {
+		return nil, err
+	} else if existing != nil {
+		_, err := s.db.Exec(`
+UPDATE codeflow_workspaces
+SET active=1, updated_at=?, last_opened_at=?
+WHERE id=?
+`, formatTS(now), formatTS(now), existing.ID)
+		if err != nil {
+			return nil, err
+		}
+		_, _ = s.db.Exec(`UPDATE codeflow_workspaces SET active=0 WHERE id<>?`, existing.ID)
+		return s.GetWorkspaceByID(existing.ID)
+	}
+	encoded, _ := json.Marshal(metadata)
+	configPath := metadata["config_path"]
+	agentMDPath := metadata["agent_md_path"]
+	defaultBranch := metadata["default_branch"]
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE codeflow_workspaces SET active=0`); err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(`
+INSERT INTO codeflow_workspaces (id, name, root_path, config_path, agent_md_path, default_branch, metadata, active, created_at, updated_at, last_opened_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+`, id, defaultTitle(name), rootPath, configPath, agentMDPath, defaultBranch, string(encoded), formatTS(now), formatTS(now), formatTS(now))
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetWorkspaceByID(id)
+}
+
+func (s *SQLiteSessionStore) ListWorkspaces() ([]workspace.Workspace, error) {
+	rows, err := s.db.Query(`
+SELECT id, name, root_path, config_path, agent_md_path, default_branch, metadata, active, created_at, updated_at, last_opened_at
+FROM codeflow_workspaces
+ORDER BY active DESC, last_opened_at DESC, created_at DESC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []workspace.Workspace{}
+	for rows.Next() {
+		item, err := scanSQLiteWorkspace(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *item)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteSessionStore) GetWorkspaceByID(id string) (*workspace.Workspace, error) {
+	row := s.db.QueryRow(`
+SELECT id, name, root_path, config_path, agent_md_path, default_branch, metadata, active, created_at, updated_at, last_opened_at
+FROM codeflow_workspaces
+WHERE id=?
+`, id)
+	item, err := scanSQLiteWorkspace(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return item, err
+}
+
+func (s *SQLiteSessionStore) GetWorkspaceByRoot(rootPath string) (*workspace.Workspace, error) {
+	row := s.db.QueryRow(`
+SELECT id, name, root_path, config_path, agent_md_path, default_branch, metadata, active, created_at, updated_at, last_opened_at
+FROM codeflow_workspaces
+WHERE root_path=?
+`, rootPath)
+	item, err := scanSQLiteWorkspace(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return item, err
+}
+
+func (s *SQLiteSessionStore) GetCurrentWorkspace() (*workspace.Workspace, error) {
+	row := s.db.QueryRow(`
+SELECT id, name, root_path, config_path, agent_md_path, default_branch, metadata, active, created_at, updated_at, last_opened_at
+FROM codeflow_workspaces
+WHERE active=1
+ORDER BY last_opened_at DESC
+LIMIT 1
+`)
+	item, err := scanSQLiteWorkspace(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return item, err
+}
+
+func (s *SQLiteSessionStore) SwitchWorkspace(id string) (*workspace.Workspace, error) {
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE codeflow_workspaces SET active=0`); err != nil {
+		return nil, err
+	}
+	result, err := tx.Exec(`UPDATE codeflow_workspaces SET active=1, updated_at=?, last_opened_at=? WHERE id=?`, formatTS(now), formatTS(now), id)
+	if err != nil {
+		return nil, err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return nil, fmt.Errorf("workspace not found: %s", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetWorkspaceByID(id)
+}
+
+func (s *SQLiteSessionStore) RemoveWorkspace(id string) error {
+	_, err := s.db.Exec(`DELETE FROM codeflow_workspaces WHERE id=?`, id)
+	return err
+}
+
 type sqliteScanner interface {
 	Scan(dest ...any) error
 }
@@ -664,6 +904,40 @@ func scanSQLiteModelConfig(row sqliteScanner) (*ModelConfig, error) {
 	}
 	item.CreatedAt = parseTS(createdAt)
 	item.UpdatedAt = parseTS(updatedAt)
+	return &item, nil
+}
+
+func scanSQLiteWorkspace(row sqliteScanner) (*workspace.Workspace, error) {
+	var (
+		item         workspace.Workspace
+		metadataJSON string
+		activeInt    int
+		createdAt    string
+		updatedAt    string
+		lastOpenedAt string
+	)
+	if err := row.Scan(
+		&item.ID,
+		&item.Name,
+		&item.RootPath,
+		&item.ConfigPath,
+		&item.AgentMDPath,
+		&item.DefaultBranch,
+		&metadataJSON,
+		&activeInt,
+		&createdAt,
+		&updatedAt,
+		&lastOpenedAt,
+	); err != nil {
+		return nil, err
+	}
+	item.Active = activeInt == 1
+	item.CreatedAt = parseTS(createdAt)
+	item.UpdatedAt = parseTS(updatedAt)
+	item.LastOpenedAt = parseTS(lastOpenedAt)
+	if metadataJSON != "" {
+		_ = json.Unmarshal([]byte(metadataJSON), &item.Metadata)
+	}
 	return &item, nil
 }
 

@@ -165,6 +165,7 @@ func (c *wsClient) runChat(ctx context.Context, msg clientMessage) {
 	events, err := c.server.engine.Run(runCtx, engine.Request{
 		SessionID:   c.sessionID,
 		RequestID:   c.requestID,
+		WorkspaceID: c.server.workspaceID,
 		ProjectRoot: c.server.root,
 		Input:       input,
 		AgentMD:     c.server.agentMD,
@@ -196,6 +197,14 @@ func (c *wsClient) runChat(ctx context.Context, msg clientMessage) {
 			c.send(serverMessage{Type: "chat.stats", ID: msg.ID, Content: event.Content})
 		case engine.EventError:
 			c.send(serverMessage{Type: "operation.error", ID: msg.ID, Error: event.Content})
+		case engine.EventIteration:
+			c.send(serverMessage{Type: "llm.iteration.started", ID: msg.ID, Content: event.Content, Status: "running"})
+		case engine.EventToolStarted:
+			c.send(serverMessage{Type: "tool.call.started", ID: msg.ID, Kind: event.ToolName, Content: event.Content, Status: "running"})
+		case engine.EventToolCompleted:
+			c.send(serverMessage{Type: "tool.call.completed", ID: msg.ID, Kind: event.ToolName, Content: event.Content, Status: "ok", DurationMillis: event.DurationMillis})
+		case engine.EventToolFailed:
+			c.send(serverMessage{Type: "tool.call.failed", ID: msg.ID, Kind: event.ToolName, Content: event.Content, Status: "error", DurationMillis: event.DurationMillis})
 		}
 	}
 	c.server.emitTaskEvent(storage.CreateTaskEventInput{

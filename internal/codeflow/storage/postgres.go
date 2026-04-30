@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	cfsession "github.com/viko0313/CodeFlow/internal/codeflow/session"
+	"github.com/viko0313/CodeFlow/internal/codeflow/workspace"
 )
 
 type PostgresSessionStore struct {
@@ -108,6 +110,111 @@ CREATE TABLE IF NOT EXISTS codeflow_model_configs (
   api_key_ciphertext TEXT NOT NULL DEFAULT '',
   api_key_hint TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codeflow_workspaces (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  root_path TEXT NOT NULL UNIQUE,
+  config_path TEXT NOT NULL DEFAULT '',
+  agent_md_path TEXT NOT NULL DEFAULT '',
+  default_branch TEXT NOT NULL DEFAULT '',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  active BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  last_opened_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_workspaces_active ON codeflow_workspaces(active, last_opened_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_runs (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL DEFAULT '',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  plan_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  started_at TIMESTAMPTZ NOT NULL,
+  ended_at TIMESTAMPTZ,
+  model_provider TEXT NOT NULL DEFAULT '',
+  model_name TEXT NOT NULL DEFAULT '',
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  total_cost TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_runs_session_started ON codeflow_runs(session_id, started_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_run_events (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  timestamp TIMESTAMPTZ NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  latency_ms BIGINT NOT NULL DEFAULT 0,
+  request_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_run_events_run_time ON codeflow_run_events(run_id, timestamp ASC);
+CREATE TABLE IF NOT EXISTS codeflow_plans (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL DEFAULT '',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  goal TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  preference JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codeflow_plan_steps (
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  requires_approval BOOLEAN NOT NULL DEFAULT false,
+  related_files JSONB NOT NULL DEFAULT '[]'::jsonb,
+  tool_calls JSONB NOT NULL DEFAULT '[]'::jsonb,
+  result_summary TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_plan_steps_plan_position ON codeflow_plan_steps(plan_id, position ASC);
+CREATE TABLE IF NOT EXISTS codeflow_plan_events (
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  step_id TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_plan_events_plan_time ON codeflow_plan_events(plan_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS codeflow_checkpoints (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  run_id TEXT NOT NULL DEFAULT '',
+  plan_step_id TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  git_head TEXT NOT NULL DEFAULT '',
+  changed_files JSONB NOT NULL DEFAULT '[]'::jsonb,
+  snapshot_path TEXT NOT NULL DEFAULT '',
+  patch_path TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS codeflow_checkpoint_files (
+  id TEXT PRIMARY KEY,
+  checkpoint_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  existed BOOLEAN NOT NULL DEFAULT false,
+  is_binary BOOLEAN NOT NULL DEFAULT false,
+  size_bytes BIGINT NOT NULL DEFAULT 0,
+  sha256 TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codeflow_checkpoint_files_checkpoint ON codeflow_checkpoint_files(checkpoint_id);
+CREATE TABLE IF NOT EXISTS codeflow_session_summaries (
+  session_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
   updated_at TIMESTAMPTZ NOT NULL
 );
 `)
@@ -374,6 +481,129 @@ LIMIT $2
 	return out, rows.Err()
 }
 
+func (s *PostgresSessionStore) Register(rootPath, name string, metadata map[string]string) (*workspace.Workspace, error) {
+	now := time.Now().UTC()
+	id := "ws_" + uuid.NewString()[:8]
+	if existing, err := s.GetWorkspaceByRoot(rootPath); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return s.SwitchWorkspace(existing.ID)
+	}
+	data, _ := json.Marshal(metadata)
+	configPath := metadata["config_path"]
+	agentMDPath := metadata["agent_md_path"]
+	defaultBranch := metadata["default_branch"]
+	tx, err := s.pool.Begin(s.ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(s.ctx)
+	if _, err := tx.Exec(s.ctx, `UPDATE codeflow_workspaces SET active=false`); err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(s.ctx, `
+INSERT INTO codeflow_workspaces (id, name, root_path, config_path, agent_md_path, default_branch, metadata, active, created_at, updated_at, last_opened_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,true,$8,$8,$8)
+`, id, defaultTitle(name), rootPath, configPath, agentMDPath, defaultBranch, string(data), now)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(s.ctx); err != nil {
+		return nil, err
+	}
+	return s.GetWorkspaceByID(id)
+}
+
+func (s *PostgresSessionStore) ListWorkspaces() ([]workspace.Workspace, error) {
+	rows, err := s.pool.Query(s.ctx, `
+SELECT id, name, root_path, config_path, agent_md_path, default_branch, metadata::text, active, created_at, updated_at, last_opened_at
+FROM codeflow_workspaces
+ORDER BY active DESC, last_opened_at DESC, created_at DESC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []workspace.Workspace{}
+	for rows.Next() {
+		item, err := scanWorkspace(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *item)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresSessionStore) GetWorkspaceByID(id string) (*workspace.Workspace, error) {
+	row := s.pool.QueryRow(s.ctx, `
+SELECT id, name, root_path, config_path, agent_md_path, default_branch, metadata::text, active, created_at, updated_at, last_opened_at
+FROM codeflow_workspaces
+WHERE id=$1
+`, id)
+	item, err := scanWorkspace(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return item, err
+}
+
+func (s *PostgresSessionStore) GetWorkspaceByRoot(rootPath string) (*workspace.Workspace, error) {
+	row := s.pool.QueryRow(s.ctx, `
+SELECT id, name, root_path, config_path, agent_md_path, default_branch, metadata::text, active, created_at, updated_at, last_opened_at
+FROM codeflow_workspaces
+WHERE root_path=$1
+`, rootPath)
+	item, err := scanWorkspace(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return item, err
+}
+
+func (s *PostgresSessionStore) GetCurrentWorkspace() (*workspace.Workspace, error) {
+	row := s.pool.QueryRow(s.ctx, `
+SELECT id, name, root_path, config_path, agent_md_path, default_branch, metadata::text, active, created_at, updated_at, last_opened_at
+FROM codeflow_workspaces
+WHERE active=true
+ORDER BY last_opened_at DESC
+LIMIT 1
+`)
+	item, err := scanWorkspace(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return item, err
+}
+
+func (s *PostgresSessionStore) SwitchWorkspace(id string) (*workspace.Workspace, error) {
+	now := time.Now().UTC()
+	tx, err := s.pool.Begin(s.ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(s.ctx)
+	if _, err := tx.Exec(s.ctx, `UPDATE codeflow_workspaces SET active=false`); err != nil {
+		return nil, err
+	}
+	tag, err := tx.Exec(s.ctx, `UPDATE codeflow_workspaces SET active=true, updated_at=$2, last_opened_at=$2 WHERE id=$1`, id, now)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, fmt.Errorf("workspace not found: %s", id)
+	}
+	if err := tx.Commit(s.ctx); err != nil {
+		return nil, err
+	}
+	return s.GetWorkspaceByID(id)
+}
+
+func (s *PostgresSessionStore) RemoveWorkspace(id string) error {
+	_, err := s.pool.Exec(s.ctx, `DELETE FROM codeflow_workspaces WHERE id=$1`, id)
+	return err
+}
+
 func (s *PostgresSessionStore) DecideApproval(id string, allowed bool, reason string) (*ApprovalRecord, error) {
 	reason = strings.TrimSpace(reason)
 	status := ApprovalStatusRejected
@@ -623,6 +853,32 @@ func scanModelConfig(row scanner) (*ModelConfig, error) {
 		&item.UpdatedAt,
 	); err != nil {
 		return nil, err
+	}
+	return &item, nil
+}
+
+func scanWorkspace(row scanner) (*workspace.Workspace, error) {
+	var (
+		item         workspace.Workspace
+		metadataJSON string
+	)
+	if err := row.Scan(
+		&item.ID,
+		&item.Name,
+		&item.RootPath,
+		&item.ConfigPath,
+		&item.AgentMDPath,
+		&item.DefaultBranch,
+		&metadataJSON,
+		&item.Active,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+		&item.LastOpenedAt,
+	); err != nil {
+		return nil, err
+	}
+	if metadataJSON != "" {
+		_ = json.Unmarshal([]byte(metadataJSON), &item.Metadata)
 	}
 	return &item, nil
 }
